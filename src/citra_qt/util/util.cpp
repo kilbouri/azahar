@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Lime3DS Emulator Project
+// Copyright 2015-2025 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -34,6 +34,21 @@ QString ReadableByteSize(qulonglong size) {
     return QStringLiteral("%L1 %2")
         .arg(size / std::pow(1024, digit_groups), 0, 'f', 1)
         .arg(QString::fromUtf8(units[digit_groups]));
+}
+
+QString ReadableDuration(qulonglong time_seconds) {
+    if (time_seconds == 0) {
+        return {};
+    }
+    const auto time_minutes = std::max(static_cast<double>(time_seconds) / 60, 1.0);
+    const auto time_hours = static_cast<double>(time_seconds) / 3600;
+    const bool is_minutes = time_minutes < 60;
+    const char* unit = is_minutes ? "m" : "h";
+    const auto value = is_minutes ? time_minutes : time_hours;
+
+    return QStringLiteral("%L1 %2")
+        .arg(value, 0, 'f', !is_minutes && time_seconds % 60 != 0)
+        .arg(QString::fromUtf8(unit));
 }
 
 QPixmap CreateCirclePixmapFromColor(const QColor& color) {
@@ -173,5 +188,21 @@ const std::string GetApplicationsDirectory() {
            "applications";
 #else
     return QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation).toStdString();
+#endif
+}
+
+QImage GetMirroredImage(QImage source_image, bool flip_horizontal, bool flip_vertical) {
+#if QT_VERSION < QT_VERSION_CHECK(6, 9, 0) // Fallback, uses deprecated method
+    return source_image.mirrored(flip_horizontal, flip_vertical);
+#else // New method
+    auto orientation_horizontal = static_cast<Qt::Orientations>(0x0);
+    auto orientation_vertical = static_cast<Qt::Orientations>(0x0);
+
+    if (flip_horizontal)
+        orientation_horizontal = Qt::Horizontal;
+    if (flip_vertical)
+        orientation_vertical = Qt::Vertical;
+
+    return source_image.flipped(orientation_horizontal | orientation_vertical);
 #endif
 }

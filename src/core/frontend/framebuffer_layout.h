@@ -1,4 +1,4 @@
-// Copyright 2016 Citra Emulator Project
+// Copyright 2016-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -32,11 +32,14 @@ struct FramebufferLayout {
     bool bottom_screen_enabled;
     Common::Rectangle<u32> top_screen;
     Common::Rectangle<u32> bottom_screen;
+    // is_rotated is true when the screen is in landscape mode - not sure why!
     bool is_rotated = true;
-    bool is_portrait = false;
-    bool additional_screen_enabled;
+    bool additional_screen_enabled = false;
+    // top_opacity is currently not used but could be used in the future
+    float top_opacity = 1.0f;
+    float bottom_opacity = 1.0f;
+    bool additional_screen_is_bottom = false;
     Common::Rectangle<u32> additional_screen;
-
     CardboardSettings cardboard;
 
     /**
@@ -44,6 +47,10 @@ struct FramebufferLayout {
      * screen.
      */
     u32 GetScalingRatio() const;
+
+    static float GetAspectRatioValue(Settings::AspectRatio aspect_ratio);
+
+    Settings::StereoRenderOption render_3d_mode = Settings::values.render_3d.GetValue();
 };
 
 /**
@@ -62,14 +69,26 @@ FramebufferLayout reverseLayout(FramebufferLayout layout);
 FramebufferLayout DefaultFrameLayout(u32 width, u32 height, bool is_swapped, bool upright);
 
 /**
- * Factory method for constructing the mobile Full Width Top layout
- * Two screens at top, full width, no gap between them
+ * Factory method for constructing the mobile Full Width (Default) layout
+ * Two screens at top, full width (so different heights)
  * @param width Window framebuffer width in pixels
  * @param height Window framebuffer height in pixels
  * @param is_swapped if true, the bottom screen will be displayed above the top screen
  * @return Newly created FramebufferLayout object with mobile portrait screen regions initialized
  */
-FramebufferLayout PortraitTopFullFrameLayout(u32 width, u32 height, bool is_swapped);
+FramebufferLayout PortraitTopFullFrameLayout(u32 width, u32 height, bool is_swapped,
+                                             bool upright = false);
+
+/**
+ * Factory method for constructing the mobile Original layout
+ * Two screens at top, equal heights
+ * @param width Window framebuffer width in pixels
+ * @param height Window framebuffer height in pixels
+ * @param is_swapped if true, the bottom screen will be displayed above the top screen
+ * @return Newly created FramebufferLayout object with mobile portrait screen regions initialized
+ */
+FramebufferLayout PortraitOriginalLayout(u32 width, u32 height, bool is_swapped,
+                                         bool upright = false);
 
 /**
  * Factory method for constructing a FramebufferLayout with only the top or bottom screen
@@ -118,6 +137,14 @@ FramebufferLayout HybridScreenLayout(u32 width, u32 height, bool swapped, bool u
  * @return Newly created FramebufferLayout object with default screen regions initialized
  */
 FramebufferLayout SeparateWindowsLayout(u32 width, u32 height, bool is_secondary, bool upright);
+
+/**
+ * Method for constructing the secondary layout for Android, based on
+ * the appropriate setting.
+ * @param width Window framebuffer width in pixels
+ * @param height Window framebuffer height in pixels
+ */
+FramebufferLayout AndroidSecondaryLayout(u32 width, u32 height);
 
 /**
  * Factory method for constructing a custom FramebufferLayout

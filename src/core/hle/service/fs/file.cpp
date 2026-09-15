@@ -1,4 +1,4 @@
-// Copyright 2018 Citra Emulator Project
+// Copyright 2018-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -75,17 +75,22 @@ void File::Read(Kernel::HLERequestContext& ctx) {
                   offset, length, backend->GetSize());
     }
 
+    const bool allows_cache_reads = backend->AllowsCachedReads();
+
     // Conventional reading if the backend does not support cache.
-    if (!backend->AllowsCachedReads()) {
+    // Do not use asynchronous operations on file reads, as in most cases
+    // there are many of them with small sizes. This causes a lot of delay
+    // due to thread communication overhead.
+    if (!allows_cache_reads) {
         auto& buffer = rp.PopMappedBuffer();
         IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
-        std::unique_ptr<u8*> data = std::make_unique<u8*>(static_cast<u8*>(operator new(length)));
-        const auto read = backend->Read(offset, length, *data);
+        std::unique_ptr<u8[]> data = std::make_unique_for_overwrite<u8[]>(length);
+        const auto read = backend->Read(offset, length, data.get());
         if (read.Failed()) {
             rb.Push(read.Code());
             rb.Push<u32>(0);
         } else {
-            buffer.Write(*data, 0, *read);
+            buffer.Write(data.get(), 0, *read);
             rb.Push(ResultSuccess);
             rb.Push<u32>(static_cast<u32>(*read));
         }
@@ -106,7 +111,7 @@ void File::Read(Kernel::HLERequestContext& ctx) {
         // Output
         Result ret{0};
         Kernel::MappedBuffer* buffer;
-        std::unique_ptr<u8*> data;
+        std::unique_ptr<u8[]> data;
         std::size_t read_size;
     };
 
@@ -115,17 +120,17 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     async_data->length = length;
     async_data->offset = offset;
     async_data->cache_ready = backend->CacheReady(offset, length);
-    if (!async_data->cache_ready) {
+    const bool really_async = !async_data->cache_ready;
+    if (really_async) {
         async_data->pre_timer = std::chrono::steady_clock::now();
     }
 
     // LOG_DEBUG(Service_FS, "cache={}, offset={}, length={}", cache_ready, offset, length);
     ctx.RunAsync(
         [this, async_data](Kernel::HLERequestContext& ctx) {
-            async_data->data =
-                std::make_unique<u8*>(static_cast<u8*>(operator new(async_data->length)));
+            async_data->data = std::make_unique_for_overwrite<u8[]>(async_data->length);
             const auto read =
-                backend->Read(async_data->offset, async_data->length, *async_data->data);
+                backend->Read(async_data->offset, async_data->length, async_data->data.get());
             if (read.Failed()) {
                 async_data->ret = read.Code();
                 async_data->read_size = 0;
@@ -156,13 +161,13 @@ void File::Read(Kernel::HLERequestContext& ctx) {
                 rb.Push(async_data->ret);
                 rb.Push<u32>(0);
             } else {
-                async_data->buffer->Write(*async_data->data, 0, async_data->read_size);
+                async_data->buffer->Write(async_data->data.get(), 0, async_data->read_size);
                 rb.Push(ResultSuccess);
                 rb.Push<u32>(static_cast<u32>(async_data->read_size));
             }
             rb.PushMappedBuffer(*async_data->buffer);
         },
-        !async_data->cache_ready);
+        really_async);
 }
 
 void File::Write(Kernel::HLERequestContext& ctx) {
@@ -170,6 +175,7 @@ void File::Write(Kernel::HLERequestContext& ctx) {
     u64 offset = rp.Pop<u64>();
     u32 length = rp.Pop<u32>();
     u32 flags = rp.Pop<u32>();
+    auto& buffer = rp.PopMappedBuffer();
     LOG_TRACE(Service_FS, "Write {}: offset=0x{:x} length={}, flags=0x{:x}", GetName(), offset,
               length, flags);
 
@@ -181,14 +187,14 @@ void File::Write(Kernel::HLERequestContext& ctx) {
     if (file->subfile) {
         rb.Push(FileSys::ResultUnsupportedOpenFlags);
         rb.Push<u32>(0);
-        rb.PushMappedBuffer(rp.PopMappedBuffer());
+        rb.PushMappedBuffer(buffer);
         return;
     }
     bool flush = (flags & 0xFF) != 0, update_timestamp = (flags & 0xFF00) != 0;
 
+    // Do not use asynchronous fs operations here for the same reason as File::Read.
     if (!backend->AllowsCachedReads()) {
         std::vector<u8> data(length);
-        auto& buffer = rp.PopMappedBuffer();
         buffer.Read(data.data(), 0, data.size());
         ResultVal<std::size_t> written =
             backend->Write(offset, data.size(), flush, update_timestamp, data.data());
@@ -224,7 +230,7 @@ void File::Write(Kernel::HLERequestContext& ctx) {
     async_data->offset = offset;
     async_data->flush = flush;
     async_data->update_timestamp = update_timestamp;
-    async_data->buffer = &rp.PopMappedBuffer();
+    async_data->buffer = &buffer;
     async_data->file = file;
 
     ctx.RunAsync(
@@ -275,7 +281,7 @@ void File::SetSize(Kernel::HLERequestContext& ctx) {
         return;
     }
 
-    if (!backend->AllowsCachedReads()) {
+    if (!backend->AllowsCachedReads() && !Settings::values.async_fs_operations) {
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
         file->size = size;
         backend->SetSize(size);
@@ -304,7 +310,7 @@ void File::Close(Kernel::HLERequestContext& ctx) {
         LOG_WARNING(Service_FS, "Closing File backend but {} clients still connected",
                     connected_sessions.size());
 
-    if (!backend->AllowsCachedReads()) {
+    if (!backend->AllowsCachedReads() && !Settings::values.async_fs_operations) {
         backend->Close();
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
         rb.Push(ResultSuccess);
@@ -335,7 +341,7 @@ void File::Flush(Kernel::HLERequestContext& ctx) {
         return;
     }
 
-    if (!backend->AllowsCachedReads()) {
+    if (!backend->AllowsCachedReads() && !Settings::values.async_fs_operations) {
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
         backend->Flush();
         rb.Push(ResultSuccess);

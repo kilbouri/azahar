@@ -1,4 +1,4 @@
-// Copyright 2015 Citra Emulator Project
+// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -63,8 +63,8 @@ void GraphicsTracingWidget::StartRecording() {
         return;
 
     auto& pica = system.GPU().PicaCore();
-    auto shader_binary = pica.vs_setup.program_code;
-    auto swizzle_data = pica.vs_setup.swizzle_data;
+    const auto& shader_binary = pica.vs_setup.GetProgramCode();
+    const auto& swizzle_data = pica.vs_setup.GetSwizzleData();
 
     // Encode floating point numbers to 24-bit values
     // TODO: Drop this explicit conversion once we store float24 values bit-correctly internally.
@@ -86,7 +86,7 @@ void GraphicsTracingWidget::StartRecording() {
 
     CiTrace::Recorder::InitialState state;
 
-    const auto copy = [&](std::vector<u32>& dest, auto& data) {
+    const auto copy = [&](std::vector<u32>& dest, const auto& data) {
         dest.resize(sizeof(data));
         std::memcpy(dest.data(), std::addressof(data), sizeof(data));
     };
@@ -113,8 +113,9 @@ void GraphicsTracingWidget::StopRecording() {
     if (!context)
         return;
 
-    QString filename = QFileDialog::getSaveFileName(
-        this, tr("Save CiTrace"), QStringLiteral("citrace.ctf"), tr("CiTrace File (*.ctf)"));
+    QString filename =
+        QFileDialog::getSaveFileName(this, tr("Save CiTrace"), QStringLiteral("citrace.ctf"),
+                                     tr("CiTrace File") + QStringLiteral(" (*.ctf)"));
 
     if (filename.isEmpty()) {
         // If the user canceled the dialog, keep recording

@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -10,6 +10,7 @@
 #include "audio_core/lle/lle.h"
 #include "common/arch.h"
 #include "common/logging/log.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/exclusive_monitor.h"
@@ -24,9 +25,13 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/dumping/backend.h"
+#include "core/file_sys/ncch_container.h"
 #include "core/frontend/image_interface.h"
+#ifdef ENABLE_GDBSTUB
 #include "core/gdbstub/gdbstub.h"
+#endif
 #include "core/global.h"
+#include "core/hle/kernel/ipc_debugger/recorder.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
 #include "core/hle/kernel/thread.h"
@@ -44,6 +49,7 @@
 #include "core/hw/aes/key.h"
 #include "core/loader/loader.h"
 #include "core/movie.h"
+#include "core/savestate.h"
 #ifdef ENABLE_SCRIPTING
 #include "core/rpc/server.h"
 #endif
@@ -77,27 +83,22 @@ System::~System() = default;
 
 System::ResultStatus System::RunLoop(bool tight_loop) {
     status = ResultStatus::Success;
+
     if (!IsPoweredOn()) {
         return ResultStatus::ErrorNotInitialized;
     }
 
+#ifdef ENABLE_GDBSTUB
     if (GDBStub::IsServerEnabled()) {
-        Kernel::Thread* thread = kernel->GetCurrentThreadManager().GetCurrentThread();
-        if (thread && running_core) {
-            running_core->SaveContext(thread->context);
+        // The break flag is only set if GDB is connected,
+        // we can do clearing here safely. If it is ever
+        // used outside, move the clearing outside the if.
+        for (auto& cpu_core : cpu_cores) {
+            cpu_core->ClearBreakFlag();
         }
         GDBStub::HandlePacket(*this);
-
-        // If the loop is halted and we want to step, use a tiny (1) number of instructions to
-        // execute. Otherwise, get out of the loop function.
-        if (GDBStub::GetCpuHaltFlag()) {
-            if (GDBStub::GetCpuStepFlag()) {
-                tight_loop = false;
-            } else {
-                return ResultStatus::Success;
-            }
-        }
     }
+#endif
 
     Signal signal{Signal::None};
     u32 param{};
@@ -125,6 +126,20 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             LOG_ERROR(Core, "A pending save state operation has not finished yet");
             status_details = "A pending save state operation has not finished yet";
             return ResultStatus::ErrorSavestate;
+        }
+        u64 title_id{};
+        if (app_loader) {
+            app_loader->ReadProgramId(title_id);
+        }
+        auto info = GetSaveStateInfo(title_id, movie.GetCurrentMovieID(), param);
+        if (info.slot == std::numeric_limits<u32>::max()) {
+            // Should not happen
+            status_details = "Failed to load savestate";
+            return ResultStatus::ErrorSavestate;
+        }
+        if (info.status == Core::SaveStateInfo::ValidationStatus::BuildMismatch) {
+            status_details = info.build_name;
+            return ResultStatus::ErrorSavestateBuildMismatch;
         }
         save_state_slot = param;
         save_state_request_time = std::chrono::steady_clock::now();
@@ -230,6 +245,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 current_core_to_execute->Step();
             }
         }
+        Reschedule();
     } else {
         // Now all cores are at the same global time. So we will run them one after the other
         // with a max slice that is the minimum of all max slices of all cores
@@ -257,6 +273,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 cpu_core->GetTimer().Idle();
                 PrepareReschedule();
             } else {
+                // In the rare case the break flag is set (due to exception thrown)
+                // there is probably no need to adjust the timer accordingly.
                 if (tight_loop) {
                     cpu_core->Run();
                 } else {
@@ -264,14 +282,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 }
             }
             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
+            Reschedule();
         }
     }
-
-    if (GDBStub::IsServerEnabled()) {
-        GDBStub::SetCpuStepFlag(false);
-    }
-
-    Reschedule();
 
     return status;
 }
@@ -293,6 +306,7 @@ System::ResultStatus System::SingleStep() {
 
 System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                   Frontend::EmuWindow* secondary_window) {
+    Settings::ResetTemporaryFrameLimit();
     FileUtil::SetCurrentRomPath(filepath);
     if (early_app_loader) {
         app_loader = std::move(early_app_loader);
@@ -300,7 +314,7 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
         app_loader = Loader::GetLoader(filepath);
     }
     if (!app_loader) {
-        LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
+        LOG_CRITICAL(Core, "Failed to obtain loader for {}", filepath);
         return ResultStatus::ErrorGetLoader;
     }
 
@@ -316,54 +330,112 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
         }
     }
 
-    auto memory_mode = app_loader->LoadKernelMemoryMode();
-    if (memory_mode.second != Loader::ResultStatus::Success) {
-        LOG_CRITICAL(Core, "Failed to determine system mode (Error {})!",
-                     static_cast<int>(memory_mode.second));
+    Kernel::MemoryMode app_mem_mode;
+    Kernel::MemoryMode system_mem_mode;
+    bool used_default_mem_mode = false;
+    Kernel::New3dsHwCapabilities app_n3ds_hw_capabilities;
 
-        switch (memory_mode.second) {
-        case Loader::ResultStatus::ErrorEncrypted:
-            return ResultStatus::ErrorLoader_ErrorEncrypted;
-        case Loader::ResultStatus::ErrorInvalidFormat:
-            return ResultStatus::ErrorLoader_ErrorInvalidFormat;
-        case Loader::ResultStatus::ErrorGbaTitle:
-            return ResultStatus::ErrorLoader_ErrorGbaTitle;
-        case Loader::ResultStatus::ErrorArtic:
-            return ResultStatus::ErrorArticDisconnected;
-        default:
-            return ResultStatus::ErrorSystemMode;
+    if (m_mem_mode) {
+        // Use memory mode set by the FIRM launch parameters
+        system_mem_mode = static_cast<Kernel::MemoryMode>(m_mem_mode.value());
+        m_mem_mode = {};
+    } else {
+        // Use default memory mode based on the n3ds setting
+        system_mem_mode = Settings::values.is_new_3ds.GetValue() ? Kernel::MemoryMode::NewProd
+                                                                 : Kernel::MemoryMode::Prod;
+        used_default_mem_mode = true;
+    }
+
+    {
+        auto memory_mode = app_loader->LoadKernelMemoryMode();
+        if (memory_mode.second != Loader::ResultStatus::Success) {
+            LOG_CRITICAL(Core, "Failed to determine system mode (Error {})!",
+                         static_cast<int>(memory_mode.second));
+
+            switch (memory_mode.second) {
+            case Loader::ResultStatus::ErrorEncrypted:
+                return ResultStatus::ErrorLoader_ErrorEncrypted;
+            case Loader::ResultStatus::ErrorInvalidFormat:
+                return ResultStatus::ErrorLoader_ErrorInvalidFormat;
+            case Loader::ResultStatus::ErrorGbaTitle:
+                return ResultStatus::ErrorLoader_ErrorGbaTitle;
+            case Loader::ResultStatus::ErrorArtic:
+                return ResultStatus::ErrorArticDisconnected;
+            default:
+                return ResultStatus::ErrorSystemMode;
+            }
+        }
+
+        ASSERT(memory_mode.first);
+        app_mem_mode = memory_mode.first.value();
+    }
+
+    auto n3ds_hw_caps = app_loader->LoadNew3dsHwCapabilities();
+    ASSERT(n3ds_hw_caps.first);
+    app_n3ds_hw_capabilities = n3ds_hw_caps.first.value();
+
+    if (!Settings::values.is_new_3ds.GetValue() && app_loader->IsN3DSExclusive()) {
+        return ResultStatus::ErrorN3DSApplication;
+    }
+
+    // If the default mem mode has been used, we do not come from a FIRM launch. On real HW
+    // however, the home menu is in charge or setting the proper memory mode when launching
+    // applications by doing a FIRM launch. Since we launch the application without going
+    // through the home menu, we need to emulate the FIRM launch having happened and set the
+    // proper memory mode.
+    if (used_default_mem_mode) {
+
+        // If we are on the Old 3DS prod mode and the application memory mode does not match, we
+        // need to adjust it. We do not need adjustment if we are on the New 3DS prod mode, as that
+        // one overrides all the Old 3DS memory modes.
+        if (system_mem_mode == Kernel::MemoryMode::Prod && app_mem_mode != system_mem_mode) {
+            system_mem_mode = app_mem_mode;
+        }
+
+        // If we are on the New 3DS prod mode, and the application needs the New 3DS extended
+        // memory mode (only CTRAging is known to do this), adjust the memory mode.
+        else if (system_mem_mode == Kernel::MemoryMode::NewProd &&
+                 app_n3ds_hw_capabilities.memory_mode == Kernel::New3dsMemoryMode::NewDev1) {
+            system_mem_mode = Kernel::MemoryMode::NewDev1;
         }
     }
 
-    ASSERT(memory_mode.first);
-    auto n3ds_hw_caps = app_loader->LoadNew3dsHwCapabilities();
-    ASSERT(n3ds_hw_caps.first);
     u32 num_cores = 2;
     if (Settings::values.is_new_3ds) {
         num_cores = 4;
     }
-    ResultStatus init_result{
-        Init(emu_window, secondary_window, *memory_mode.first, *n3ds_hw_caps.first, num_cores)};
+    ResultStatus init_result{Init(emu_window, secondary_window, system_mem_mode, num_cores)};
     if (init_result != ResultStatus::Success) {
         LOG_CRITICAL(Core, "Failed to initialize system (Error {})!",
                      static_cast<u32>(init_result));
         System::Shutdown();
         return init_result;
     }
-    gpu->ReportLoadingProgramID(program_id);
+
+    kernel->UpdateCPUAndMemoryState(program_id, app_mem_mode, app_n3ds_hw_capabilities);
 
     // Restore any parameters that should be carried through a reset.
-    if (restore_deliver_arg.has_value()) {
-        if (auto apt = Service::APT::GetModule(*this)) {
+    if (auto apt = Service::APT::GetModule(*this)) {
+        if (restore_deliver_arg.has_value()) {
             apt->GetAppletManager()->SetDeliverArg(restore_deliver_arg);
+            restore_deliver_arg.reset();
         }
-        restore_deliver_arg.reset();
+        if (restore_sys_menu_arg.has_value()) {
+            apt->GetAppletManager()->SetSysMenuArg(restore_sys_menu_arg.value());
+            restore_sys_menu_arg.reset();
+        }
+        apt->SetWirelessRebootInfoBuffer(restore_wireless_reboot_info);
     }
+
     if (restore_plugin_context.has_value()) {
         if (auto plg_ldr = Service::PLGLDR::GetService(*this)) {
             plg_ldr->SetPluginLoaderContext(restore_plugin_context.value());
         }
         restore_plugin_context.reset();
+    }
+
+    if (restore_ipc_recorder) {
+        kernel->RestoreIPCRecorder(std::move(restore_ipc_recorder));
     }
 
     std::shared_ptr<Kernel::Process> process;
@@ -379,6 +451,10 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
             return ResultStatus::ErrorLoader_ErrorInvalidFormat;
         case Loader::ResultStatus::ErrorGbaTitle:
             return ResultStatus::ErrorLoader_ErrorGbaTitle;
+        case Loader::ResultStatus::ErrorPatches:
+            return ResultStatus::ErrorLoader_ErrorPatches;
+        case Loader::ResultStatus::ErrorPatchesInvalidTitle:
+            return ResultStatus::ErrorLoader_ErrorPatchesInvalidTitle;
         case Loader::ResultStatus::ErrorArtic:
             return ResultStatus::ErrorArticDisconnected;
         default:
@@ -393,7 +469,7 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     }
 
     cheat_engine.LoadCheatFile(title_id);
-    cheat_engine.Connect();
+    cheat_engine.Connect(process->process_id);
 
     perf_stats = std::make_unique<PerfStats>(title_id);
 
@@ -408,7 +484,6 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     m_emu_window = &emu_window;
     m_secondary_window = secondary_window;
     m_filepath = filepath;
-    self_delete_pending = false;
 
     // Reset counters and set time origin to current frame
     [[maybe_unused]] const PerfStats::Results result = GetAndResetPerfStats();
@@ -418,7 +493,7 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
 
 void System::PrepareReschedule() {
     running_core->PrepareReschedule();
-    reschedule_pending = true;
+    curr_core_reschedule_pending = true;
 }
 
 PerfStats::Results System::GetAndResetPerfStats() {
@@ -435,21 +510,27 @@ double System::GetStableFrameTimeScale() {
 }
 
 void System::Reschedule() {
-    if (!reschedule_pending) {
+    if (!curr_core_reschedule_pending) {
         return;
     }
 
-    reschedule_pending = false;
-    for (const auto& core : cpu_cores) {
-        LOG_TRACE(Core_ARM11, "Reschedule core {}", core->GetID());
-        kernel->GetThreadManager(core->GetID()).Reschedule();
-    }
+    curr_core_reschedule_pending = false;
+    kernel->GetThreadManager(running_core->GetID()).Reschedule();
 }
 
 System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
                                   Frontend::EmuWindow* secondary_window,
-                                  Kernel::MemoryMode memory_mode,
-                                  const Kernel::New3dsHwCapabilities& n3ds_hw_caps, u32 num_cores) {
+                                  Kernel::MemoryMode memory_mode, u32 num_cores) {
+    // Notification for system initialization (either boot or savestate).
+    if (on_init_callback) {
+        on_init_callback(true);
+    }
+    SCOPE_EXIT({
+        if (on_init_callback) {
+            on_init_callback(false);
+        }
+    });
+
     LOG_DEBUG(HW_Memory, "initialized OK");
 
     memory = std::make_unique<Memory::MemorySystem>(*this);
@@ -458,7 +539,7 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
                                       movie.GetOverrideBaseTicks());
 
     kernel = std::make_unique<Kernel::KernelSystem>(
-        *memory, *timing, [this] { PrepareReschedule(); }, memory_mode, num_cores, n3ds_hw_caps,
+        *memory, *timing, [this] { PrepareReschedule(); }, memory_mode, num_cores,
         movie.GetOverrideInitTime());
 
     exclusive_monitor = MakeExclusiveMonitor(*memory, num_cores);
@@ -472,7 +553,7 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
 #else
         for (u32 i = 0; i < num_cores; ++i) {
             cpu_cores.push_back(
-                std::make_shared<ARM_DynCom>(this, *memory, USER32MODE, i, timing->GetTimer(i)));
+                std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i, timing->GetTimer(i)));
         }
         LOG_WARNING(Core, "CPU JIT requested, but Dynarmic not available");
 #endif
@@ -495,14 +576,14 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
         dsp_core = std::make_unique<AudioCore::DspLle>(*this, multithread);
     }
 
-    memory->SetDSP(*dsp_core);
-
     dsp_core->SetSink(Settings::values.output_type.GetValue(),
                       Settings::values.output_device.GetValue());
     dsp_core->EnableStretching(Settings::values.enable_audio_stretching.GetValue());
 
 #ifdef ENABLE_SCRIPTING
-    rpc_server = std::make_unique<RPC::Server>(*this);
+    if (Settings::values.enable_rpc_server.GetValue()) {
+        rpc_server = std::make_unique<RPC::Server>(*this);
+    }
 #endif
 
     service_manager = std::make_unique<Service::SM::ServiceManager>(*this);
@@ -512,7 +593,9 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     app_loader->ReadProgramId(loading_title_id);
     HW::AES::InitKeys();
     Service::Init(*this, loading_title_id, lle_modules, !app_loader->DoingInitialSetup());
+#ifdef ENABLE_GDBSTUB
     GDBStub::DeferStart();
+#endif
 
     if (!registered_image_interface) {
         registered_image_interface = std::make_shared<Frontend::ImageInterface>();
@@ -522,14 +605,17 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
 
     auto gsp = service_manager->GetService<Service::GSP::GSP_GPU>("gsp::Gpu");
     gpu = std::make_unique<VideoCore::GPU>(*this, emu_window, secondary_window);
-    gpu->SetInterruptHandler(
-        [gsp](Service::GSP::InterruptId interrupt_id) { gsp->SignalInterrupt(interrupt_id); });
+    gpu->SetInterruptHandler([gsp](Service::GSP::InterruptId interrupt_id, u64 wait_delay_ns) {
+        gsp->SignalInterrupt(interrupt_id, wait_delay_ns);
+    });
 
     auto plg_ldr = Service::PLGLDR::GetService(*this);
     if (plg_ldr) {
         plg_ldr->SetEnabled(Settings::values.plugin_loader_enabled.GetValue());
         plg_ldr->SetAllowGameChangeState(Settings::values.allow_plugin_loader.GetValue());
     }
+
+    SetInfoLEDColor({});
 
     LOG_DEBUG(Core, "Initialized OK");
 
@@ -634,7 +720,9 @@ void System::Shutdown(bool is_deserializing) {
     gpu.reset();
     if (!is_deserializing) {
         lle_modules.clear();
+#ifdef ENABLE_GDBSTUB
         GDBStub::Shutdown();
+#endif
         perf_stats.reset();
         app_loader.reset();
     }
@@ -661,9 +749,7 @@ void System::Shutdown(bool is_deserializing) {
 
     memory.reset();
 
-    if (self_delete_pending)
-        FileUtil::Delete(m_filepath);
-    self_delete_pending = false;
+    SetInfoLEDColor({});
 
     LOG_DEBUG(Core, "Shutdown OK");
 }
@@ -677,10 +763,14 @@ void System::Reset() {
     // This is needed as we don't currently support proper app jumping.
     if (auto apt = Service::APT::GetModule(*this)) {
         restore_deliver_arg = apt->GetAppletManager()->ReceiveDeliverArg();
+        restore_sys_menu_arg = apt->GetAppletManager()->GetSysMenuArg();
+        restore_wireless_reboot_info = apt->GetWirelessRebootInfoBuffer();
     }
     if (auto plg_ldr = Service::PLGLDR::GetService(*this)) {
         restore_plugin_context = plg_ldr->GetPluginLoaderContext();
     }
+
+    restore_ipc_recorder = std::move(kernel->BackupIPCRecorder());
 
     Shutdown();
 
@@ -695,8 +785,15 @@ void System::Reset() {
 }
 
 void System::ApplySettings() {
-    GDBStub::SetServerPort(Settings::values.gdbstub_port.GetValue());
-    GDBStub::ToggleServer(Settings::values.use_gdbstub.GetValue());
+#ifdef ENABLE_GDBSTUB
+    if (override_gdb_port != -1) {
+        GDBStub::SetServerPort(override_gdb_port);
+        GDBStub::ToggleServer(true);
+    } else {
+        GDBStub::SetServerPort(Settings::values.gdbstub_port.GetValue());
+        GDBStub::ToggleServer(Settings::values.use_gdbstub.GetValue());
+    }
+#endif
 
     if (gpu) {
 #ifndef ANDROID
@@ -749,8 +846,33 @@ void System::RegisterAppLoaderEarly(std::unique_ptr<Loader::AppLoader>& loader) 
     early_app_loader = std::move(loader);
 }
 
+void System::InsertCartridge(const std::string& path) {
+    FileSys::NCCHContainer cartridge_container(path);
+    if (cartridge_container.LoadHeader() == Loader::ResultStatus::Success &&
+        cartridge_container.IsNCSD()) {
+        inserted_cartridge = path;
+    }
+}
+
+void System::EjectCartridge() {
+    inserted_cartridge.clear();
+}
+
 bool System::IsInitialSetup() {
     return app_loader && app_loader->DoingInitialSetup();
+}
+
+void System::DebugUnscheduleAllThreadsFromFrontend(bool unschedule) {
+    if (!is_powered_on)
+        return;
+
+    for (auto proc : kernel->GetProcessList()) {
+        if (unschedule) {
+            proc->SetUnscheduleMode(Kernel::UnscheduleMode::FRONTEND);
+        } else {
+            proc->ClearUnscheduleMode(Kernel::UnscheduleMode::FRONTEND);
+        }
+    }
 }
 
 template <class Archive>
@@ -774,17 +896,19 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     }
 
     ar & lle_modules;
+    Kernel::MemoryMode mem_mode{};
+    if (!Archive::is_loading::value) {
+        mem_mode = kernel->GetMemoryMode();
+    }
+    ar & mem_mode;
 
     if (Archive::is_loading::value) {
         // When loading, we want to make sure any lingering state gets cleared out before we begin.
         // Shutdown, but persist a few things between loads...
         Shutdown(true);
 
-        // Re-initialize everything like it was before
-        auto memory_mode = this->app_loader->LoadKernelMemoryMode();
-        auto n3ds_hw_caps = this->app_loader->LoadNew3dsHwCapabilities();
-        [[maybe_unused]] const System::ResultStatus result = Init(
-            *m_emu_window, m_secondary_window, *memory_mode.first, *n3ds_hw_caps.first, num_cores);
+        [[maybe_unused]] const System::ResultStatus result =
+            Init(*m_emu_window, m_secondary_window, mem_mode, num_cores);
     }
 
     // Flush on save, don't flush on load
@@ -813,16 +937,39 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
 
     // This needs to be set from somewhere - might as well be here!
     if (Archive::is_loading::value) {
+        u32 cheats_pid;
+        ar & cheats_pid;
         timing->UnlockEventQueue();
-        memory->SetDSP(*dsp_core);
-        cheat_engine.Connect();
-        gpu->Sync();
+        cheat_engine.Connect(cheats_pid);
+
+        if (Settings::values.custom_textures) {
+            custom_tex_manager->FindCustomTextures();
+        }
 
         // Re-register gpu callback, because gsp service changed after service_manager got
         // serialized
         auto gsp = service_manager->GetService<Service::GSP::GSP_GPU>("gsp::Gpu");
-        gpu->SetInterruptHandler(
-            [gsp](Service::GSP::InterruptId interrupt_id) { gsp->SignalInterrupt(interrupt_id); });
+        gpu->SetInterruptHandler([gsp](Service::GSP::InterruptId interrupt_id, u64 wait_delay_ns) {
+            gsp->SignalInterrupt(interrupt_id, wait_delay_ns);
+        });
+
+        // Apply per program settings and switch the shader cache to the title running when the
+        // savestate was created.
+        // TODO(PabloMK7): Find better way to obtain the program ID.
+        const u32 thread_id = gsp->GetActiveClientThreadId();
+        if (thread_id != std::numeric_limits<u32>::max()) {
+            const auto thread = kernel->GetThreadByID(thread_id);
+            if (thread) {
+                const std::shared_ptr<Kernel::Process> process = thread->owner_process.lock();
+                if (process) {
+                    gpu->ApplyPerProgramSettings(process->codeset->program_id);
+                    gpu->Renderer().Rasterizer()->SwitchDiskResources(process->codeset->program_id);
+                }
+            }
+        }
+    } else {
+        u32 cheats_pid = cheat_engine.GetConnectedPID();
+        ar & cheats_pid;
     }
 
     save_state_status = SaveStateStatus::NONE;

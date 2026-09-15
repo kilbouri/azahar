@@ -1,4 +1,4 @@
-// Copyright 2023 Citra Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -6,7 +6,6 @@ package org.citra.citra_emu.features.settings.ui.viewholder
 
 import android.view.View
 import androidx.core.content.res.ResourcesCompat
-import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.activities.EmulationActivity
 import org.citra.citra_emu.databinding.ListItemSettingBinding
 import org.citra.citra_emu.features.settings.model.view.RunnableSetting
@@ -60,14 +59,17 @@ class RunnableViewHolder(val binding: ListItemSettingBinding, adapter: SettingsA
 
     override fun onClick(clicked: View) {
         if (!setting.isRuntimeRunnable && EmulationActivity.isRunning()) {
-            adapter.onClickDisabledSetting()
+            adapter.onClickDisabledSetting(true, setting.disabledMessage)
         } else {
             setting.runnable.invoke()
         }
     }
 
     override fun onLongClick(clicked: View): Boolean {
-        // no-op
-        return true
+        if (!setting.isEditable) {
+            adapter.onClickDisabledSetting(true, setting.disabledMessage)
+            return true
+        }
+        return setting.onLongClick?.invoke() ?: true
     }
 }

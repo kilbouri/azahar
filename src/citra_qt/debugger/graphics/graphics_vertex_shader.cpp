@@ -1,4 +1,4 @@
-// Copyright 2014 Citra Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -343,9 +343,9 @@ QVariant GraphicsVertexShaderModel::data(const QModelIndex& index, int role) con
 }
 
 void GraphicsVertexShaderWidget::DumpShader() {
-    QString filename = QFileDialog::getSaveFileName(this, tr("Save Shader Dump"),
-                                                    QStringLiteral("shader_dump.shbin"),
-                                                    tr("Shader Binary (*.shbin)"));
+    QString filename = QFileDialog::getSaveFileName(
+        this, tr("Save Shader Dump"), QStringLiteral("shader_dump.shbin"),
+        tr("Shader Binary") + QStringLiteral(" (*.shbin)"));
 
     if (filename.isEmpty()) {
         // If the user canceled the dialog, don't dump anything.
@@ -508,11 +508,13 @@ void GraphicsVertexShaderWidget::Reload(bool replace_vertex_data, const void* ve
     info.Clear();
 
     auto& pica = system.GPU().PicaCore();
-    for (auto instr : pica.vs_setup.program_code)
+    const auto& program_code = pica.vs_setup.GetProgramCode();
+    const auto& swizzle_data = pica.vs_setup.GetSwizzleData();
+    for (auto instr : program_code)
         info.code.push_back({instr});
     int num_attributes = pica.regs.internal.vs.max_input_attribute_index + 1;
 
-    for (auto pattern : pica.vs_setup.swizzle_data) {
+    for (auto pattern : swizzle_data) {
         const nihstro::SwizzleInfo swizzle_info = {.pattern = nihstro::SwizzlePattern{pattern}};
         info.swizzle_info.push_back(swizzle_info);
     }
@@ -561,31 +563,31 @@ void GraphicsVertexShaderWidget::OnCycleIndexChanged(int index) {
 
     auto& record = debug_data.records[index];
     if (record.mask & Pica::Shader::DebugDataRecord::SRC1)
-        text += tr("SRC1: %1, %2, %3, %4\n")
+        text += QStringLiteral("SRC1: %1, %2, %3, %4\n")
                     .arg(record.src1.x.ToFloat32())
                     .arg(record.src1.y.ToFloat32())
                     .arg(record.src1.z.ToFloat32())
                     .arg(record.src1.w.ToFloat32());
     if (record.mask & Pica::Shader::DebugDataRecord::SRC2)
-        text += tr("SRC2: %1, %2, %3, %4\n")
+        text += QStringLiteral("SRC2: %1, %2, %3, %4\n")
                     .arg(record.src2.x.ToFloat32())
                     .arg(record.src2.y.ToFloat32())
                     .arg(record.src2.z.ToFloat32())
                     .arg(record.src2.w.ToFloat32());
     if (record.mask & Pica::Shader::DebugDataRecord::SRC3)
-        text += tr("SRC3: %1, %2, %3, %4\n")
+        text += QStringLiteral("SRC3: %1, %2, %3, %4\n")
                     .arg(record.src3.x.ToFloat32())
                     .arg(record.src3.y.ToFloat32())
                     .arg(record.src3.z.ToFloat32())
                     .arg(record.src3.w.ToFloat32());
     if (record.mask & Pica::Shader::DebugDataRecord::DEST_IN)
-        text += tr("DEST_IN: %1, %2, %3, %4\n")
+        text += QStringLiteral("DEST_IN: %1, %2, %3, %4\n")
                     .arg(record.dest_in.x.ToFloat32())
                     .arg(record.dest_in.y.ToFloat32())
                     .arg(record.dest_in.z.ToFloat32())
                     .arg(record.dest_in.w.ToFloat32());
     if (record.mask & Pica::Shader::DebugDataRecord::DEST_OUT)
-        text += tr("DEST_OUT: %1, %2, %3, %4\n")
+        text += QStringLiteral("DEST_OUT: %1, %2, %3, %4\n")
                     .arg(record.dest_out.x.ToFloat32())
                     .arg(record.dest_out.y.ToFloat32())
                     .arg(record.dest_out.z.ToFloat32())
@@ -616,9 +618,10 @@ void GraphicsVertexShaderWidget::OnCycleIndexChanged(int index) {
     text +=
         tr("Instruction offset: 0x%1").arg(4 * record.instruction_offset, 4, 16, QLatin1Char('0'));
     if (record.mask & Pica::Shader::DebugDataRecord::NEXT_INSTR) {
-        text += tr(" -> 0x%2").arg(4 * record.next_instruction, 4, 16, QLatin1Char('0'));
+        text +=
+            QStringLiteral(" -> 0x%2").arg(4 * record.next_instruction, 4, 16, QLatin1Char('0'));
     } else {
-        text += tr(" (last instruction)");
+        text += QStringLiteral(" ") + tr("(last instruction)");
     }
 
     instruction_description->setText(text);

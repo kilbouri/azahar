@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -8,6 +8,8 @@
 #include "common/math_util.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
+#include "core/core.h"
+#include "core/loader/loader.h"
 #include "core/memory.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -31,7 +33,7 @@ using namespace Common::Literals;
 using namespace Pica::Shader::Generator;
 
 constexpr u64 STREAM_BUFFER_SIZE = 64_MiB;
-constexpr u64 UNIFORM_BUFFER_SIZE = 4_MiB;
+constexpr u64 UNIFORM_BUFFER_SIZE = 8_MiB;
 constexpr u64 TEXTURE_BUFFER_SIZE = 2_MiB;
 
 constexpr vk::BufferUsageFlags BUFFER_USAGE =
@@ -85,7 +87,7 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
 
     // Define vertex layout for software shaders
     MakeSoftwareVertexLayout();
-    pipeline_info.vertex_layout = software_layout;
+    pipeline_info.state.vertex_layout = software_layout;
 
     const vk::Device device = instance.GetDevice();
     texture_lf_view = device.createBufferViewUnique({
@@ -122,43 +124,115 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
     Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
     Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SAMPLER_ID);
 
+    const vk::ImageView null_surface_view =
+        instance.IsNullDescriptorSupported() ? vk::ImageView{} : null_surface.ImageView();
+    const vk::ImageView null_surface_storage_view =
+        instance.IsNullDescriptorSupported() ? vk::ImageView{} : null_surface.StorageView();
+
     // Prepare texture and utility descriptor sets.
     for (u32 i = 0; i < 3; i++) {
-        update_queue.AddImageSampler(texture_set, i, 0, null_surface.ImageView(),
-                                     null_sampler.Handle());
+        update_queue.AddImageSampler(texture_set, i, 0, null_surface_view, null_sampler.Handle());
     }
 
     const auto utility_set = pipeline_cache.Acquire(DescriptorHeapType::Utility);
-    update_queue.AddStorageImage(utility_set, 0, null_surface.StorageView());
-    update_queue.AddImageSampler(utility_set, 1, 0, null_surface.ImageView(),
-                                 null_sampler.Handle());
+    update_queue.AddStorageImage(utility_set, 0, null_surface_storage_view);
+    update_queue.AddImageSampler(utility_set, 1, 0, null_surface_view, null_sampler.Handle());
     update_queue.Flush();
-
-    SyncEntireState();
 }
 
 RasterizerVulkan::~RasterizerVulkan() = default;
 
 void RasterizerVulkan::TickFrame() {
+    scheduler.WaitWorker();
     res_cache.TickFrame();
 }
 
-void RasterizerVulkan::LoadDiskResources(const std::atomic_bool& stop_loading,
-                                         const VideoCore::DiskResourceLoadCallback& callback) {
-    pipeline_cache.LoadDiskCache();
+void RasterizerVulkan::LoadDefaultDiskResources(
+    const std::atomic_bool& stop_loading, const VideoCore::DiskResourceLoadCallback& callback) {
+
+    u64 program_id;
+    if (Core::System::GetInstance().GetAppLoader().ReadProgramId(program_id) !=
+        Loader::ResultStatus::Success) {
+        program_id = 0;
+    }
+
+    if (callback) {
+        callback(VideoCore::LoadCallbackStage::Prepare, 0, 0, "");
+    }
+
+    pipeline_cache.SetProgramID(program_id);
+    pipeline_cache.SetAccurateMul(accurate_mul);
+    pipeline_cache.LoadCache(stop_loading, callback);
+
+    if (callback) {
+        callback(VideoCore::LoadCallbackStage::Complete, 0, 0, "");
+    }
 }
 
-void RasterizerVulkan::SyncFixedState() {
-    SyncCullMode();
-    SyncBlendEnabled();
-    SyncBlendFuncs();
-    SyncBlendColor();
-    SyncLogicOp();
-    SyncStencilTest();
-    SyncDepthTest();
-    SyncColorWriteMask();
-    SyncStencilWriteMask();
-    SyncDepthWriteMask();
+void RasterizerVulkan::SyncDrawState() {
+    SyncDrawUniforms();
+
+    // SyncCullMode();
+    pipeline_info.state.rasterization.cull_mode.Assign(regs.rasterizer.cull_mode);
+    // If the framebuffer is flipped, request to also flip vulkan viewport
+    const bool is_flipped = regs.framebuffer.framebuffer.IsFlipped();
+    pipeline_info.state.rasterization.flip_viewport.Assign(is_flipped);
+    // SyncBlendEnabled();
+    pipeline_info.state.blending.blend_enable = regs.framebuffer.output_merger.alphablend_enable;
+    // SyncBlendFuncs();
+    pipeline_info.state.blending.color_blend_eq.Assign(
+        regs.framebuffer.output_merger.alpha_blending.blend_equation_rgb);
+    pipeline_info.state.blending.alpha_blend_eq.Assign(
+        regs.framebuffer.output_merger.alpha_blending.blend_equation_a);
+    pipeline_info.state.blending.src_color_blend_factor.Assign(
+        regs.framebuffer.output_merger.alpha_blending.factor_source_rgb);
+    pipeline_info.state.blending.dst_color_blend_factor.Assign(
+        regs.framebuffer.output_merger.alpha_blending.factor_dest_rgb);
+    pipeline_info.state.blending.src_alpha_blend_factor.Assign(
+        regs.framebuffer.output_merger.alpha_blending.factor_source_a);
+    pipeline_info.state.blending.dst_alpha_blend_factor.Assign(
+        regs.framebuffer.output_merger.alpha_blending.factor_dest_a);
+    // SyncBlendColor();
+    pipeline_info.dynamic_info.blend_color = regs.framebuffer.output_merger.blend_const.raw;
+    // SyncLogicOp();
+    // SyncColorWriteMask();
+    pipeline_info.state.blending.logic_op = regs.framebuffer.output_merger.logic_op;
+
+    const u32 color_mask = regs.framebuffer.framebuffer.allow_color_write != 0
+                               ? (regs.framebuffer.output_merger.depth_color_mask >> 8) & 0xF
+                               : 0;
+    pipeline_info.state.blending.color_write_mask = color_mask;
+
+    // SyncStencilTest();
+    const auto& stencil_test = regs.framebuffer.output_merger.stencil_test;
+    const bool test_enable = stencil_test.enable && regs.framebuffer.framebuffer.depth_format ==
+                                                        Pica::FramebufferRegs::DepthFormat::D24S8;
+
+    pipeline_info.state.depth_stencil.stencil_test_enable.Assign(test_enable);
+    pipeline_info.state.depth_stencil.stencil_fail_op.Assign(stencil_test.action_stencil_fail);
+    pipeline_info.state.depth_stencil.stencil_pass_op.Assign(stencil_test.action_depth_pass);
+    pipeline_info.state.depth_stencil.stencil_depth_fail_op.Assign(stencil_test.action_depth_fail);
+    pipeline_info.state.depth_stencil.stencil_compare_op.Assign(stencil_test.func);
+    pipeline_info.dynamic_info.stencil_reference = stencil_test.reference_value;
+    pipeline_info.dynamic_info.stencil_compare_mask = stencil_test.input_mask;
+    // SyncStencilWriteMask();
+    pipeline_info.dynamic_info.stencil_write_mask =
+        (regs.framebuffer.framebuffer.allow_depth_stencil_write != 0)
+            ? static_cast<u32>(regs.framebuffer.output_merger.stencil_test.write_mask)
+            : 0;
+    // SyncDepthTest();
+    const bool test_enabled = regs.framebuffer.output_merger.depth_test_enable == 1 ||
+                              regs.framebuffer.output_merger.depth_write_enable == 1;
+    const auto compare_op = regs.framebuffer.output_merger.depth_test_enable == 1
+                                ? regs.framebuffer.output_merger.depth_test_func.Value()
+                                : Pica::FramebufferRegs::CompareFunc::Always;
+
+    pipeline_info.state.depth_stencil.depth_test_enable.Assign(test_enabled);
+    pipeline_info.state.depth_stencil.depth_compare_op.Assign(compare_op);
+    // SyncDepthWriteMask();
+    const bool write_enable = (regs.framebuffer.framebuffer.allow_depth_stencil_write != 0 &&
+                               regs.framebuffer.output_merger.depth_write_enable);
+    pipeline_info.state.depth_stencil.depth_write_enable.Assign(write_enable);
 }
 
 void RasterizerVulkan::SetupVertexArray() {
@@ -177,7 +251,7 @@ void RasterizerVulkan::SetupVertexArray() {
     const PAddr base_address = vertex_attributes.GetPhysicalBaseAddress(); // GPUREG_ATTR_BUF_BASE
     const u32 stride_alignment = instance.GetMinVertexStrideAlignment();
 
-    VertexLayout& layout = pipeline_info.vertex_layout;
+    VertexLayout& layout = pipeline_info.state.vertex_layout;
     layout.binding_count = 0;
     layout.attribute_count = 16;
     enable_attributes.fill(false);
@@ -253,7 +327,8 @@ void RasterizerVulkan::SetupVertexArray() {
         VertexBinding& binding = layout.bindings[layout.binding_count];
         binding.binding.Assign(layout.binding_count);
         binding.fixed.Assign(0);
-        binding.stride.Assign(aligned_stride);
+        // Will be adjusted on pipeline build, to keep the info transferable.
+        binding.byte_count.Assign(loader.byte_count);
 
         // Keep track of the binding offsets so we can bind the vertex buffer later
         binding_offsets[layout.binding_count++] = static_cast<u32>(array_offset + buffer_offset);
@@ -268,7 +343,7 @@ void RasterizerVulkan::SetupVertexArray() {
 
 void RasterizerVulkan::SetupFixedAttribs() {
     const auto& vertex_attributes = regs.pipeline.vertex_attributes;
-    VertexLayout& layout = pipeline_info.vertex_layout;
+    VertexLayout& layout = pipeline_info.state.vertex_layout;
 
     auto [fixed_ptr, fixed_offset, _] = stream_buffer.Map(16 * sizeof(Common::Vec4f), 0);
     binding_offsets[layout.binding_count] = static_cast<u32>(fixed_offset);
@@ -322,7 +397,7 @@ void RasterizerVulkan::SetupFixedAttribs() {
     VertexBinding& binding = layout.bindings[layout.binding_count];
     binding.binding.Assign(layout.binding_count++);
     binding.fixed.Assign(1);
-    binding.stride.Assign(offset);
+    binding.byte_count.Assign(offset);
 
     stream_buffer.Commit(offset);
 }
@@ -330,7 +405,7 @@ void RasterizerVulkan::SetupFixedAttribs() {
 bool RasterizerVulkan::SetupVertexShader() {
     MICROPROFILE_SCOPE(Vulkan_VS);
     return pipeline_cache.UseProgrammableVertexShader(regs, pica.vs_setup,
-                                                      pipeline_info.vertex_layout, accurate_mul);
+                                                      pipeline_info.state.vertex_layout);
 }
 
 bool RasterizerVulkan::SetupGeometryShader() {
@@ -343,8 +418,9 @@ bool RasterizerVulkan::SetupGeometryShader() {
 
     // Enable the quaternion fix-up geometry-shader only if we are actually doing per-fragment
     // lighting and care about proper quaternions. Otherwise just use standard vertex+fragment
-    // shaders. We also don't need a geometry shader if the barycentric extension is supported.
-    if (regs.lighting.disable || instance.IsFragmentShaderBarycentricSupported()) {
+    // shaders. We also don't need a geometry shader if the barycentric extension is supported,
+    // but that will be decided later as the GS config needs to be cached anyways.
+    if (regs.lighting.disable) {
         pipeline_cache.UseTrivialGeometryShader();
         return true;
     }
@@ -362,7 +438,7 @@ bool RasterizerVulkan::AccelerateDrawBatch(bool is_indexed) {
         }
     }
 
-    pipeline_info.rasterization.topology.Assign(regs.pipeline.triangle_topology);
+    pipeline_info.state.rasterization.topology.Assign(regs.pipeline.triangle_topology);
     if (regs.pipeline.triangle_topology == TriangleTopology::Fan &&
         !instance.IsTriangleFanSupported()) {
         LOG_DEBUG(Render_Vulkan,
@@ -373,6 +449,10 @@ bool RasterizerVulkan::AccelerateDrawBatch(bool is_indexed) {
     // Vertex data setup might involve scheduler flushes so perform it
     // early to avoid invalidating our state in the middle of the draw.
     vertex_info = AnalyzeVertexArray(is_indexed, instance.GetMinVertexStrideAlignment());
+    if (vertex_info.Invalid()) {
+        // Do not draw anything if the vertex array is invalid.
+        return true;
+    }
     SetupVertexArray();
 
     if (!SetupVertexShader()) {
@@ -398,7 +478,7 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
     const DrawParams params = {
         .vertex_count = regs.pipeline.num_vertices,
         .vertex_offset = -static_cast<s32>(vertex_info.vs_input_index_min),
-        .binding_count = pipeline_info.vertex_layout.binding_count,
+        .binding_count = pipeline_info.state.vertex_layout.binding_count,
         .bindings = binding_offsets,
         .is_indexed = is_indexed,
     };
@@ -452,8 +532,8 @@ void RasterizerVulkan::DrawTriangles() {
         return;
     }
 
-    pipeline_info.rasterization.topology.Assign(Pica::PipelineRegs::TriangleTopology::List);
-    pipeline_info.vertex_layout = software_layout;
+    pipeline_info.state.rasterization.topology.Assign(Pica::PipelineRegs::TriangleTopology::List);
+    pipeline_info.state.vertex_layout = software_layout;
 
     pipeline_cache.UseTrivialVertexShader();
     pipeline_cache.UseTrivialGeometryShader();
@@ -463,18 +543,19 @@ void RasterizerVulkan::DrawTriangles() {
 
 bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     MICROPROFILE_SCOPE(Vulkan_Drawing);
+    SyncDrawState();
 
     const bool shadow_rendering = regs.framebuffer.IsShadowRendering();
     const bool has_stencil = regs.framebuffer.HasStencil();
 
-    const bool write_color_fb = shadow_rendering || pipeline_info.blending.color_write_mask;
+    const bool write_color_fb = shadow_rendering || pipeline_info.GetFinalColorWriteMask(instance);
     const bool write_depth_fb = pipeline_info.IsDepthWriteEnabled();
     const bool using_color_fb =
         regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() != 0 && write_color_fb;
     const bool using_depth_fb =
         !shadow_rendering && regs.framebuffer.framebuffer.GetDepthBufferPhysicalAddress() != 0 &&
         (write_depth_fb || regs.framebuffer.output_merger.depth_test_enable != 0 ||
-         (has_stencil && pipeline_info.depth_stencil.stencil_test_enable));
+         (has_stencil && pipeline_info.state.depth_stencil.stencil_test_enable));
 
     const auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
     const Framebuffer* framebuffer = fb_helper.Framebuffer();
@@ -482,21 +563,24 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         return true;
     }
 
-    pipeline_info.attachments.color = framebuffer->Format(SurfaceType::Color);
-    pipeline_info.attachments.depth = framebuffer->Format(SurfaceType::Depth);
+    const auto draw_rect = fb_helper.DrawRect();
+    if (draw_rect.GetArea() == 0) {
+        return true;
+    }
+
+    pipeline_info.state.attachments.color = framebuffer->Format(SurfaceType::Color);
+    pipeline_info.state.attachments.depth = framebuffer->Format(SurfaceType::Depth);
 
     // Update scissor uniforms
     const auto [scissor_x1, scissor_y2, scissor_x2, scissor_y1] = fb_helper.Scissor();
-    if (fs_uniform_block_data.data.scissor_x1 != scissor_x1 ||
-        fs_uniform_block_data.data.scissor_x2 != scissor_x2 ||
-        fs_uniform_block_data.data.scissor_y1 != scissor_y1 ||
-        fs_uniform_block_data.data.scissor_y2 != scissor_y2) {
+    if (fs_data.scissor_x1 != scissor_x1 || fs_data.scissor_x2 != scissor_x2 ||
+        fs_data.scissor_y1 != scissor_y1 || fs_data.scissor_y2 != scissor_y2) {
 
-        fs_uniform_block_data.data.scissor_x1 = scissor_x1;
-        fs_uniform_block_data.data.scissor_x2 = scissor_x2;
-        fs_uniform_block_data.data.scissor_y1 = scissor_y1;
-        fs_uniform_block_data.data.scissor_y2 = scissor_y2;
-        fs_uniform_block_data.dirty = true;
+        fs_data.scissor_x1 = scissor_x1;
+        fs_data.scissor_x2 = scissor_x2;
+        fs_data.scissor_y1 = scissor_y1;
+        fs_data.scissor_y2 = scissor_y2;
+        fs_data_dirty = true;
     }
 
     // Sync and bind the texture surfaces
@@ -504,16 +588,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     SyncUtilityTextures(framebuffer);
 
     // Sync and bind the shader
-    if (shader_dirty) {
-        pipeline_cache.UseFragmentShader(regs, user_config);
-        shader_dirty = false;
-    }
-
-    // If the framebuffer is flipped, request to also flip vulkan viewport
-    const bool is_flipped = regs.framebuffer.framebuffer.IsFlipped();
-    vs_uniform_block_data.dirty |= (vs_uniform_block_data.data.flip_viewport != 0) != is_flipped;
-    vs_uniform_block_data.data.flip_viewport = is_flipped;
-    pipeline_info.rasterization.flip_viewport.Assign(is_flipped);
+    pipeline_cache.UseFragmentShader(regs, user_config);
 
     // Sync the LUTs within the texture buffer
     SyncAndUploadLUTs();
@@ -521,18 +596,17 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     UploadUniforms(accelerate);
 
     // Begin rendering
-    const auto draw_rect = fb_helper.DrawRect();
     renderpass_cache.BeginRendering(framebuffer, draw_rect);
 
     // Configure viewport and scissor
     const auto viewport = fb_helper.Viewport();
-    pipeline_info.dynamic.viewport = Common::Rectangle<s32>{
+    pipeline_info.dynamic_info.viewport = Common::Rectangle<s32>{
         viewport.x,
         viewport.y,
         viewport.x + viewport.width,
         viewport.y + viewport.height,
     };
-    pipeline_info.dynamic.scissor = draw_rect;
+    pipeline_info.dynamic_info.scissor = draw_rect;
 
     // Draw the vertex batch
     bool succeeded = true;
@@ -572,10 +646,33 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
 
         // If the texture unit is disabled bind a null surface to it
         if (!texture.enabled) {
-            const Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
-            const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SAMPLER_ID);
-            update_queue.AddImageSampler(texture_set, texture_index, 0, null_surface.ImageView(),
-                                         null_sampler.Handle());
+            switch (texture.config.type.Value()) {
+            case TextureType::TextureCube:
+            case TextureType::ShadowCube: {
+                const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_CUBE_ID);
+                if (instance.IsNullDescriptorSupported()) {
+                    update_queue.AddImageSampler(texture_set, texture_index, 0, vk::ImageView{},
+                                                 null_sampler.Handle());
+                } else {
+                    Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_CUBE_ID);
+                    update_queue.AddImageSampler(texture_set, texture_index, 0,
+                                                 null_surface.ImageView(), null_sampler.Handle());
+                }
+                break;
+            }
+            default: {
+                const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_ID);
+                if (instance.IsNullDescriptorSupported()) {
+                    update_queue.AddImageSampler(texture_set, texture_index, 0, vk::ImageView{},
+                                                 null_sampler.Handle());
+                } else {
+                    Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
+                    update_queue.AddImageSampler(texture_set, texture_index, 0,
+                                                 null_surface.ImageView(), null_sampler.Handle());
+                }
+                break;
+            }
+            }
             continue;
         }
 
@@ -585,7 +682,7 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
             case TextureType::Shadow2D: {
                 Surface& surface = res_cache.GetTextureSurface(texture);
                 Sampler& sampler = res_cache.GetSampler(texture.config);
-                surface.flags |= VideoCore::SurfaceFlagBits::ShadowMap;
+                surface.flags |= VideoCore::SurfaceFlagBits::ShadowSource;
                 update_queue.AddImageSampler(texture_set, texture_index, 0, surface.StorageView(),
                                              sampler.Handle());
                 continue;
@@ -607,7 +704,7 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
         Surface& surface = res_cache.GetTextureSurface(texture);
         Sampler& sampler = res_cache.GetSampler(texture.config);
         const vk::ImageView color_view = framebuffer->ImageView(SurfaceType::Color);
-        const bool is_feedback_loop = color_view == surface.ImageView();
+        const bool is_feedback_loop = color_view == surface.FramebufferView();
         const vk::ImageView texture_view =
             is_feedback_loop ? surface.CopyImageView() : surface.ImageView();
         update_queue.AddImageSampler(texture_set, texture_index, 0, texture_view, sampler.Handle());
@@ -615,13 +712,35 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::SyncUtilityTextures(const Framebuffer* framebuffer) {
-    const bool shadow_rendering = regs.framebuffer.IsShadowRendering();
-    if (!shadow_rendering) {
-        return;
+    const bool shadow_writing = regs.framebuffer.IsShadowRendering();
+    bool shadow_reading = regs.lighting.config0.enable_shadow;
+    // Ensure the shadow-texture slot is actually enabled
+    if (shadow_reading) {
+        const u32 shadow_texture_unit = regs.lighting.config0.shadow_selector.Value();
+        const auto shadow_texture = regs.texturing.GetTextures()[shadow_texture_unit];
+        shadow_reading &= shadow_texture.enabled;
     }
 
     const auto utility_set = pipeline_cache.Acquire(DescriptorHeapType::Utility);
-    update_queue.AddStorageImage(utility_set, 0, framebuffer->ImageView(SurfaceType::Color));
+
+    // Reading and writing are mutually exclusive
+    assert(!(shadow_writing && shadow_reading));
+
+    if (shadow_writing) {
+        update_queue.AddStorageImage(utility_set, 0, framebuffer->ImageView(SurfaceType::Color));
+    } else if (shadow_reading) {
+        const u32 shadow_texture_unit = regs.lighting.config0.shadow_selector.Value();
+        const auto shadow_texture = regs.texturing.GetTextures()[shadow_texture_unit];
+        Surface& shadow_surface = res_cache.GetTextureSurface(shadow_texture);
+        update_queue.AddStorageImage(utility_set, 0, shadow_surface.StorageView());
+    } else {
+        if (instance.IsNullDescriptorSupported()) {
+            update_queue.AddStorageImage(utility_set, 0, vk::ImageView{});
+        } else {
+            Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
+            update_queue.AddStorageImage(utility_set, 0, null_surface.StorageView());
+        }
+    }
 }
 
 void RasterizerVulkan::BindShadowCube(const Pica::TexturingRegs::FullTextureConfig& texture,
@@ -641,7 +760,7 @@ void RasterizerVulkan::BindShadowCube(const Pica::TexturingRegs::FullTextureConf
 
         const VideoCore::SurfaceId surface_id = res_cache.GetTextureSurface(info);
         Surface& surface = res_cache.GetSurface(surface_id);
-        surface.flags |= VideoCore::SurfaceFlagBits::ShadowMap;
+        surface.flags |= VideoCore::SurfaceFlagBits::ShadowSource;
         update_queue.AddImageSampler(texture_set, 0, binding, surface.StorageView(),
                                      sampler.Handle());
     }
@@ -665,68 +784,6 @@ void RasterizerVulkan::BindTextureCube(const Pica::TexturingRegs::FullTextureCon
     Surface& surface = res_cache.GetTextureCube(config);
     Sampler& sampler = res_cache.GetSampler(texture.config);
     update_queue.AddImageSampler(texture_set, 0, 0, surface.ImageView(), sampler.Handle());
-}
-
-void RasterizerVulkan::NotifyFixedFunctionPicaRegisterChanged(u32 id) {
-    switch (id) {
-    // Culling
-    case PICA_REG_INDEX(rasterizer.cull_mode):
-        SyncCullMode();
-        break;
-
-    // Blending
-    case PICA_REG_INDEX(framebuffer.output_merger.alphablend_enable):
-        SyncBlendEnabled();
-        // Update since logic op emulation depends on alpha blend enable.
-        SyncLogicOp();
-        SyncColorWriteMask();
-        break;
-    case PICA_REG_INDEX(framebuffer.output_merger.alpha_blending):
-        SyncBlendFuncs();
-        break;
-    case PICA_REG_INDEX(framebuffer.output_merger.blend_const):
-        SyncBlendColor();
-        break;
-
-    // Sync VK stencil test + stencil write mask
-    // (Pica stencil test function register also contains a stencil write mask)
-    case PICA_REG_INDEX(framebuffer.output_merger.stencil_test.raw_func):
-        SyncStencilTest();
-        SyncStencilWriteMask();
-        break;
-    case PICA_REG_INDEX(framebuffer.output_merger.stencil_test.raw_op):
-    case PICA_REG_INDEX(framebuffer.framebuffer.depth_format):
-        SyncStencilTest();
-        break;
-
-    // Sync VK depth test + depth and color write mask
-    // (Pica depth test function register also contains a depth and color write mask)
-    case PICA_REG_INDEX(framebuffer.output_merger.depth_test_enable):
-        SyncDepthTest();
-        SyncDepthWriteMask();
-        SyncColorWriteMask();
-        break;
-
-    // Sync VK depth and stencil write mask
-    // (This is a dedicated combined depth / stencil write-enable register)
-    case PICA_REG_INDEX(framebuffer.framebuffer.allow_depth_stencil_write):
-        SyncDepthWriteMask();
-        SyncStencilWriteMask();
-        break;
-
-    // Sync VK color write mask
-    // (This is a dedicated color write-enable register)
-    case PICA_REG_INDEX(framebuffer.framebuffer.allow_color_write):
-        SyncColorWriteMask();
-        break;
-
-    // Logic op
-    case PICA_REG_INDEX(framebuffer.output_merger.logic_op):
-        SyncLogicOp();
-        // Update since color write mask is used to emulate no-op.
-        SyncColorWriteMask();
-        break;
-    }
 }
 
 void RasterizerVulkan::FlushAll() {
@@ -785,7 +842,7 @@ bool RasterizerVulkan::AccelerateDisplay(const Pica::FramebufferConfig& config,
         return false;
     }
 
-    const Surface& src_surface = res_cache.GetSurface(src_surface_id);
+    Surface& src_surface = res_cache.GetSurface(src_surface_id);
     const u32 scaled_width = src_surface.GetScaledWidth();
     const u32 scaled_height = src_surface.GetScaledHeight();
 
@@ -810,7 +867,7 @@ void RasterizerVulkan::MakeSoftwareVertexLayout() {
         VertexBinding& binding = software_layout.bindings[i];
         binding.binding.Assign(i);
         binding.fixed.Assign(0);
-        binding.stride.Assign(sizeof(HardwareVertex));
+        binding.byte_count.Assign(sizeof(HardwareVertex));
     }
 
     u32 offset = 0;
@@ -825,164 +882,49 @@ void RasterizerVulkan::MakeSoftwareVertexLayout() {
     }
 }
 
-void RasterizerVulkan::SyncCullMode() {
-    pipeline_info.rasterization.cull_mode.Assign(regs.rasterizer.cull_mode);
-}
-
-void RasterizerVulkan::SyncBlendEnabled() {
-    pipeline_info.blending.blend_enable = regs.framebuffer.output_merger.alphablend_enable;
-}
-
-void RasterizerVulkan::SyncBlendFuncs() {
-    pipeline_info.blending.color_blend_eq.Assign(
-        regs.framebuffer.output_merger.alpha_blending.blend_equation_rgb);
-    pipeline_info.blending.alpha_blend_eq.Assign(
-        regs.framebuffer.output_merger.alpha_blending.blend_equation_a);
-    pipeline_info.blending.src_color_blend_factor.Assign(
-        regs.framebuffer.output_merger.alpha_blending.factor_source_rgb);
-    pipeline_info.blending.dst_color_blend_factor.Assign(
-        regs.framebuffer.output_merger.alpha_blending.factor_dest_rgb);
-    pipeline_info.blending.src_alpha_blend_factor.Assign(
-        regs.framebuffer.output_merger.alpha_blending.factor_source_a);
-    pipeline_info.blending.dst_alpha_blend_factor.Assign(
-        regs.framebuffer.output_merger.alpha_blending.factor_dest_a);
-}
-
-void RasterizerVulkan::SyncBlendColor() {
-    pipeline_info.dynamic.blend_color = regs.framebuffer.output_merger.blend_const.raw;
-}
-
-void RasterizerVulkan::SyncLogicOp() {
-    if (instance.NeedsLogicOpEmulation()) {
-        // We need this in the fragment shader to emulate logic operations
-        shader_dirty = true;
-    }
-
-    pipeline_info.blending.logic_op = regs.framebuffer.output_merger.logic_op;
-
-    const bool is_logic_op_emulated =
-        instance.NeedsLogicOpEmulation() && !regs.framebuffer.output_merger.alphablend_enable;
-    const bool is_logic_op_noop =
-        regs.framebuffer.output_merger.logic_op == Pica::FramebufferRegs::LogicOp::NoOp;
-    if (is_logic_op_emulated && is_logic_op_noop) {
-        // Color output is disabled by logic operation. We use color write mask to skip
-        // color but allow depth write.
-        pipeline_info.blending.color_write_mask = 0;
-    }
-}
-
-void RasterizerVulkan::SyncColorWriteMask() {
-    const u32 color_mask = regs.framebuffer.framebuffer.allow_color_write != 0
-                               ? (regs.framebuffer.output_merger.depth_color_mask >> 8) & 0xF
-                               : 0;
-
-    const bool is_logic_op_emulated =
-        instance.NeedsLogicOpEmulation() && !regs.framebuffer.output_merger.alphablend_enable;
-    const bool is_logic_op_noop =
-        regs.framebuffer.output_merger.logic_op == Pica::FramebufferRegs::LogicOp::NoOp;
-    if (is_logic_op_emulated && is_logic_op_noop) {
-        // Color output is disabled by logic operation. We use color write mask to skip
-        // color but allow depth write. Return early to avoid overwriting this.
-        return;
-    }
-
-    pipeline_info.blending.color_write_mask = color_mask;
-}
-
-void RasterizerVulkan::SyncStencilWriteMask() {
-    pipeline_info.dynamic.stencil_write_mask =
-        (regs.framebuffer.framebuffer.allow_depth_stencil_write != 0)
-            ? static_cast<u32>(regs.framebuffer.output_merger.stencil_test.write_mask)
-            : 0;
-}
-
-void RasterizerVulkan::SyncDepthWriteMask() {
-    const bool write_enable = (regs.framebuffer.framebuffer.allow_depth_stencil_write != 0 &&
-                               regs.framebuffer.output_merger.depth_write_enable);
-    pipeline_info.depth_stencil.depth_write_enable.Assign(write_enable);
-}
-
-void RasterizerVulkan::SyncStencilTest() {
-    const auto& stencil_test = regs.framebuffer.output_merger.stencil_test;
-    const bool test_enable = stencil_test.enable && regs.framebuffer.framebuffer.depth_format ==
-                                                        Pica::FramebufferRegs::DepthFormat::D24S8;
-
-    pipeline_info.depth_stencil.stencil_test_enable.Assign(test_enable);
-    pipeline_info.depth_stencil.stencil_fail_op.Assign(stencil_test.action_stencil_fail);
-    pipeline_info.depth_stencil.stencil_pass_op.Assign(stencil_test.action_depth_pass);
-    pipeline_info.depth_stencil.stencil_depth_fail_op.Assign(stencil_test.action_depth_fail);
-    pipeline_info.depth_stencil.stencil_compare_op.Assign(stencil_test.func);
-    pipeline_info.dynamic.stencil_reference = stencil_test.reference_value;
-    pipeline_info.dynamic.stencil_compare_mask = stencil_test.input_mask;
-}
-
-void RasterizerVulkan::SyncDepthTest() {
-    const bool test_enabled = regs.framebuffer.output_merger.depth_test_enable == 1 ||
-                              regs.framebuffer.output_merger.depth_write_enable == 1;
-    const auto compare_op = regs.framebuffer.output_merger.depth_test_enable == 1
-                                ? regs.framebuffer.output_merger.depth_test_func.Value()
-                                : Pica::FramebufferRegs::CompareFunc::Always;
-
-    pipeline_info.depth_stencil.depth_test_enable.Assign(test_enabled);
-    pipeline_info.depth_stencil.depth_compare_op.Assign(compare_op);
-}
-
 void RasterizerVulkan::SyncAndUploadLUTsLF() {
     constexpr std::size_t max_size =
         sizeof(Common::Vec2f) * 256 * Pica::LightingRegs::NumLightingSampler +
         sizeof(Common::Vec2f) * 128; // fog
 
-    if (!fs_uniform_block_data.lighting_lut_dirty_any && !fs_uniform_block_data.fog_lut_dirty) {
+    if (!pica.lighting.lut_dirty && !pica.fog.lut_dirty) {
         return;
     }
 
     std::size_t bytes_used = 0;
     auto [buffer, offset, invalidate] = texture_lf_buffer.Map(max_size, sizeof(Common::Vec4f));
 
-    // Sync the lighting luts
-    if (fs_uniform_block_data.lighting_lut_dirty_any || invalidate) {
-        for (unsigned index = 0; index < fs_uniform_block_data.lighting_lut_dirty.size(); index++) {
-            if (fs_uniform_block_data.lighting_lut_dirty[index] || invalidate) {
-                std::array<Common::Vec2f, 256> new_data;
-                const auto& source_lut = pica.lighting.luts[index];
-                std::transform(source_lut.begin(), source_lut.end(), new_data.begin(),
-                               [](const auto& entry) {
-                                   return Common::Vec2f{entry.ToFloat(), entry.DiffToFloat()};
-                               });
+    if (invalidate) {
+        pica.lighting.lut_dirty = pica.lighting.LutAllDirty;
+        pica.fog.lut_dirty = true;
+    }
 
-                if (new_data != lighting_lut_data[index] || invalidate) {
-                    lighting_lut_data[index] = new_data;
-                    std::memcpy(buffer + bytes_used, new_data.data(),
-                                new_data.size() * sizeof(Common::Vec2f));
-                    fs_uniform_block_data.data.lighting_lut_offset[index / 4][index % 4] =
-                        static_cast<int>((offset + bytes_used) / sizeof(Common::Vec2f));
-                    fs_uniform_block_data.dirty = true;
-                    bytes_used += new_data.size() * sizeof(Common::Vec2f);
-                }
-                fs_uniform_block_data.lighting_lut_dirty[index] = false;
-            }
+    // Sync the lighting luts
+    while (pica.lighting.lut_dirty) {
+        u32 index = std::countr_zero(pica.lighting.lut_dirty);
+        pica.lighting.lut_dirty &= ~(1 << index);
+
+        Common::Vec2f* new_data = reinterpret_cast<Common::Vec2f*>(buffer + bytes_used);
+        const auto& source_lut = pica.lighting.luts[index];
+        for (u32 i = 0; i < source_lut.size(); i++) {
+            new_data[i] = {source_lut[i].ToFloat(), source_lut[i].DiffToFloat()};
         }
-        fs_uniform_block_data.lighting_lut_dirty_any = false;
+        fs_data.lighting_lut_offset[index / 4][index % 4] =
+            static_cast<int>((offset + bytes_used) / sizeof(Common::Vec2f));
+        fs_data_dirty = true;
+        bytes_used += source_lut.size() * sizeof(Common::Vec2f);
     }
 
     // Sync the fog lut
-    if (fs_uniform_block_data.fog_lut_dirty || invalidate) {
-        std::array<Common::Vec2f, 128> new_data;
-
-        std::transform(
-            pica.fog.lut.begin(), pica.fog.lut.end(), new_data.begin(),
-            [](const auto& entry) { return Common::Vec2f{entry.ToFloat(), entry.DiffToFloat()}; });
-
-        if (new_data != fog_lut_data || invalidate) {
-            fog_lut_data = new_data;
-            std::memcpy(buffer + bytes_used, new_data.data(),
-                        new_data.size() * sizeof(Common::Vec2f));
-            fs_uniform_block_data.data.fog_lut_offset =
-                static_cast<int>((offset + bytes_used) / sizeof(Common::Vec2f));
-            fs_uniform_block_data.dirty = true;
-            bytes_used += new_data.size() * sizeof(Common::Vec2f);
+    if (pica.fog.lut_dirty) {
+        Common::Vec2f* new_data = reinterpret_cast<Common::Vec2f*>(buffer + bytes_used);
+        for (u32 i = 0; i < pica.fog.lut.size(); i++) {
+            new_data[i] = {pica.fog.lut[i].ToFloat(), pica.fog.lut[i].DiffToFloat()};
         }
-        fs_uniform_block_data.fog_lut_dirty = false;
+        fs_data.fog_lut_offset = static_cast<int>((offset + bytes_used) / sizeof(Common::Vec2f));
+        fs_data_dirty = true;
+        bytes_used += pica.fog.lut.size() * sizeof(Common::Vec2f);
+        pica.fog.lut_dirty = false;
     }
 
     texture_lf_buffer.Commit(static_cast<u32>(bytes_used));
@@ -995,109 +937,76 @@ void RasterizerVulkan::SyncAndUploadLUTs() {
         sizeof(Common::Vec4f) * 256 +     // proctex
         sizeof(Common::Vec4f) * 256;      // proctex diff
 
-    if (!fs_uniform_block_data.proctex_noise_lut_dirty &&
-        !fs_uniform_block_data.proctex_color_map_dirty &&
-        !fs_uniform_block_data.proctex_alpha_map_dirty &&
-        !fs_uniform_block_data.proctex_lut_dirty && !fs_uniform_block_data.proctex_diff_lut_dirty) {
+    if (!pica.proctex.lut_dirty) {
         return;
     }
 
     std::size_t bytes_used = 0;
     auto [buffer, offset, invalidate] = texture_buffer.Map(max_size, sizeof(Common::Vec4f));
 
-    // helper function for SyncProcTexNoiseLUT/ColorMap/AlphaMap
-    auto sync_proctex_value_lut =
-        [this, buffer = buffer, offset = offset, invalidate = invalidate,
-         &bytes_used](const std::array<Pica::PicaCore::ProcTex::ValueEntry, 128>& lut,
-                      std::array<Common::Vec2f, 128>& lut_data, int& lut_offset) {
-            std::array<Common::Vec2f, 128> new_data;
-            std::transform(lut.begin(), lut.end(), new_data.begin(), [](const auto& entry) {
-                return Common::Vec2f{entry.ToFloat(), entry.DiffToFloat()};
-            });
+    if (invalidate) {
+        pica.proctex.table_dirty = pica.proctex.TableAllDirty;
+    }
 
-            if (new_data != lut_data || invalidate) {
-                lut_data = new_data;
-                std::memcpy(buffer + bytes_used, new_data.data(),
-                            new_data.size() * sizeof(Common::Vec2f));
-                lut_offset = static_cast<int>((offset + bytes_used) / sizeof(Common::Vec2f));
-                fs_uniform_block_data.dirty = true;
-                bytes_used += new_data.size() * sizeof(Common::Vec2f);
+    // helper function for SyncProcTexNoiseLUT/ColorMap/AlphaMap
+    const auto sync_proctex_value_lut =
+        [&](const std::array<Pica::PicaCore::ProcTex::ValueEntry, 128>& lut, int& lut_offset) {
+            Common::Vec2f* new_data = reinterpret_cast<Common::Vec2f*>(buffer + bytes_used);
+            for (u32 i = 0; i < lut.size(); i++) {
+                new_data[i] = {lut[i].ToFloat(), lut[i].DiffToFloat()};
             }
+            lut_offset = static_cast<int>((offset + bytes_used) / sizeof(Common::Vec2f));
+            fs_data_dirty = true;
+            bytes_used += lut.size() * sizeof(Common::Vec2f);
         };
 
     // Sync the proctex noise lut
-    if (fs_uniform_block_data.proctex_noise_lut_dirty || invalidate) {
-        sync_proctex_value_lut(proctex.noise_table, proctex_noise_lut_data,
-                               fs_uniform_block_data.data.proctex_noise_lut_offset);
-        fs_uniform_block_data.proctex_noise_lut_dirty = false;
+    if (pica.proctex.noise_lut_dirty) {
+        sync_proctex_value_lut(proctex.noise_table, fs_data.proctex_noise_lut_offset);
     }
 
     // Sync the proctex color map
-    if (fs_uniform_block_data.proctex_color_map_dirty || invalidate) {
-        sync_proctex_value_lut(proctex.color_map_table, proctex_color_map_data,
-                               fs_uniform_block_data.data.proctex_color_map_offset);
-        fs_uniform_block_data.proctex_color_map_dirty = false;
+    if (pica.proctex.color_map_dirty) {
+        sync_proctex_value_lut(proctex.color_map_table, fs_data.proctex_color_map_offset);
     }
 
     // Sync the proctex alpha map
-    if (fs_uniform_block_data.proctex_alpha_map_dirty || invalidate) {
-        sync_proctex_value_lut(proctex.alpha_map_table, proctex_alpha_map_data,
-                               fs_uniform_block_data.data.proctex_alpha_map_offset);
-        fs_uniform_block_data.proctex_alpha_map_dirty = false;
+    if (pica.proctex.alpha_map_dirty) {
+        sync_proctex_value_lut(proctex.alpha_map_table, fs_data.proctex_alpha_map_offset);
     }
 
     // Sync the proctex lut
-    if (fs_uniform_block_data.proctex_lut_dirty || invalidate) {
-        std::array<Common::Vec4f, 256> new_data;
-
-        std::transform(proctex.color_table.begin(), proctex.color_table.end(), new_data.begin(),
-                       [](const auto& entry) {
-                           auto rgba = entry.ToVector() / 255.0f;
-                           return Common::Vec4f{rgba.r(), rgba.g(), rgba.b(), rgba.a()};
-                       });
-
-        if (new_data != proctex_lut_data || invalidate) {
-            proctex_lut_data = new_data;
-            std::memcpy(buffer + bytes_used, new_data.data(),
-                        new_data.size() * sizeof(Common::Vec4f));
-            fs_uniform_block_data.data.proctex_lut_offset =
-                static_cast<int>((offset + bytes_used) / sizeof(Common::Vec4f));
-            fs_uniform_block_data.dirty = true;
-            bytes_used += new_data.size() * sizeof(Common::Vec4f);
+    if (pica.proctex.lut_dirty) {
+        Common::Vec4f* new_data = reinterpret_cast<Common::Vec4f*>(buffer + bytes_used);
+        for (u32 i = 0; i < proctex.color_table.size(); i++) {
+            new_data[i] = proctex.color_table[i].ToVector() / 255.0f;
         }
-        fs_uniform_block_data.proctex_lut_dirty = false;
+        fs_data.proctex_lut_offset =
+            static_cast<int>((offset + bytes_used) / sizeof(Common::Vec4f));
+        fs_data_dirty = true;
+        bytes_used += proctex.color_table.size() * sizeof(Common::Vec4f);
     }
 
     // Sync the proctex difference lut
-    if (fs_uniform_block_data.proctex_diff_lut_dirty || invalidate) {
-        std::array<Common::Vec4f, 256> new_data;
-
-        std::transform(proctex.color_diff_table.begin(), proctex.color_diff_table.end(),
-                       new_data.begin(), [](const auto& entry) {
-                           auto rgba = entry.ToVector() / 255.0f;
-                           return Common::Vec4f{rgba.r(), rgba.g(), rgba.b(), rgba.a()};
-                       });
-
-        if (new_data != proctex_diff_lut_data || invalidate) {
-            proctex_diff_lut_data = new_data;
-            std::memcpy(buffer + bytes_used, new_data.data(),
-                        new_data.size() * sizeof(Common::Vec4f));
-            fs_uniform_block_data.data.proctex_diff_lut_offset =
-                static_cast<int>((offset + bytes_used) / sizeof(Common::Vec4f));
-            fs_uniform_block_data.dirty = true;
-            bytes_used += new_data.size() * sizeof(Common::Vec4f);
+    if (pica.proctex.diff_lut_dirty) {
+        Common::Vec4f* new_data = reinterpret_cast<Common::Vec4f*>(buffer + bytes_used);
+        for (u32 i = 0; i < proctex.color_diff_table.size(); i++) {
+            new_data[i] = proctex.color_diff_table[i].ToVector() / 255.0f;
         }
-        fs_uniform_block_data.proctex_diff_lut_dirty = false;
+        fs_data.proctex_diff_lut_offset =
+            static_cast<int>((offset + bytes_used) / sizeof(Common::Vec4f));
+        fs_data_dirty = true;
+        bytes_used += proctex.color_diff_table.size() * sizeof(Common::Vec4f);
     }
+
+    pica.proctex.table_dirty = 0;
 
     texture_buffer.Commit(static_cast<u32>(bytes_used));
 }
 
 void RasterizerVulkan::UploadUniforms(bool accelerate_draw) {
-    const bool sync_vs_pica = accelerate_draw;
-    const bool sync_vs = vs_uniform_block_data.dirty;
-    const bool sync_fs = fs_uniform_block_data.dirty;
-    if (!sync_vs_pica && !sync_vs && !sync_fs) {
+    const bool sync_vs_pica = accelerate_draw && pica.vs_setup.uniforms_dirty;
+    if (!sync_vs_pica && !vs_data_dirty && !fs_data_dirty) {
         return;
     }
 
@@ -1108,34 +1017,45 @@ void RasterizerVulkan::UploadUniforms(bool accelerate_draw) {
 
     u32 used_bytes = 0;
 
-    if (sync_vs || invalidate) {
-        std::memcpy(uniforms + used_bytes, &vs_uniform_block_data.data,
-                    sizeof(vs_uniform_block_data.data));
-
+    if (vs_data_dirty || invalidate) {
+        std::memcpy(uniforms + used_bytes, &vs_data, sizeof(vs_data));
         pipeline_cache.UpdateRange(1, offset + used_bytes);
-        vs_uniform_block_data.dirty = false;
+        vs_data_dirty = false;
         used_bytes += uniform_size_aligned_vs;
     }
 
-    if (sync_fs || invalidate) {
-        std::memcpy(uniforms + used_bytes, &fs_uniform_block_data.data,
-                    sizeof(fs_uniform_block_data.data));
-
+    if (fs_data_dirty || invalidate) {
+        std::memcpy(uniforms + used_bytes, &fs_data, sizeof(fs_data));
         pipeline_cache.UpdateRange(2, offset + used_bytes);
-        fs_uniform_block_data.dirty = false;
+        fs_data_dirty = false;
         used_bytes += uniform_size_aligned_fs;
     }
 
-    if (sync_vs_pica) {
+    if (sync_vs_pica || invalidate) {
         VSPicaUniformData vs_uniforms;
-        vs_uniforms.uniforms.SetFromRegs(regs.vs, pica.vs_setup);
+        vs_uniforms.SetFromRegs(pica.vs_setup);
         std::memcpy(uniforms + used_bytes, &vs_uniforms, sizeof(vs_uniforms));
-
         pipeline_cache.UpdateRange(0, offset + used_bytes);
+        pica.vs_setup.uniforms_dirty = false;
         used_bytes += uniform_size_aligned_vs_pica;
     }
 
     uniform_buffer.Commit(used_bytes);
+}
+
+void RasterizerVulkan::SwitchDiskResources(u64 title_id) {
+    std::atomic_bool stop_loading = false;
+
+    if (switch_disk_resources_callback) {
+        switch_disk_resources_callback(VideoCore::LoadCallbackStage::Prepare, 0, 0, "");
+    }
+
+    pipeline_cache.SetAccurateMul(accurate_mul);
+    pipeline_cache.SwitchCache(title_id, stop_loading, switch_disk_resources_callback);
+
+    if (switch_disk_resources_callback) {
+        switch_disk_resources_callback(VideoCore::LoadCallbackStage::Complete, 0, 0, "");
+    }
 }
 
 } // namespace Vulkan

@@ -1,10 +1,11 @@
-// Copyright Citra Emulator Project / Lime3DS Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
 package org.citra.citra_emu.features.settings.model.view
 
-import org.citra.citra_emu.NativeLibrary
+import androidx.annotation.StringRes
+import org.citra.citra_emu.R
 import org.citra.citra_emu.activities.EmulationActivity
 import org.citra.citra_emu.features.settings.model.AbstractSetting
 
@@ -22,10 +23,20 @@ abstract class SettingsItem(
 ) {
     abstract val type: Int
 
-    val isEditable: Boolean
+    open val isEditable: Boolean
         get() {
             if (!EmulationActivity.isRunning()) return true
             return setting?.isRuntimeEditable ?: false
+        }
+
+    open var isEnabled: Boolean = true
+
+    @StringRes open var disabledMessage: Int =
+        R.string.setting_disabled_description_incompatible_setting
+
+    val isActive: Boolean
+        get() {
+            return this.isEditable && this.isEnabled
         }
 
     companion object {
@@ -40,5 +51,6 @@ abstract class SettingsItem(
         const val TYPE_INPUT_BINDING = 8
         const val TYPE_STRING_INPUT = 9
         const val TYPE_FLOAT_INPUT = 10
+        const val TYPE_MULTI_CHOICE = 11
     }
 }

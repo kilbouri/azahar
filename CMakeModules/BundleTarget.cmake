@@ -117,6 +117,9 @@ if (BUNDLE_TARGET_EXECUTE)
             set(extra_linuxdeploy_args --plugin qt)
         endif()
 
+        # Set up app icon
+        file(COPY_FILE "${source_path}/dist/azahar.svg" "${CMAKE_BINARY_DIR}/dist/org.azahar_emu.Azahar.svg")
+
         message(STATUS "Creating AppDir for executable ${executable_path}")
         execute_process(COMMAND ${CMAKE_COMMAND} -E env
             ${extra_linuxdeploy_env}
@@ -124,28 +127,13 @@ if (BUNDLE_TARGET_EXECUTE)
             ${extra_linuxdeploy_args}
             --plugin checkrt
             --executable "${executable_path}"
-            --icon-file "${source_path}/dist/citra.svg"
+            --icon-file "${CMAKE_BINARY_DIR}/dist/org.azahar_emu.Azahar.svg"
             --desktop-file "${source_path}/dist/${executable_name}.desktop"
             --appdir "${appdir_path}"
-            RESULT_VARIABLE linuxdeploy_appdir_result)
+            RESULT_VARIABLE linuxdeploy_appdir_result
+            ERROR_VARIABLE linuxdeploy_appdir_error)
         if (NOT linuxdeploy_appdir_result EQUAL "0")
-            message(FATAL_ERROR "linuxdeploy failed to create AppDir: ${linuxdeploy_appdir_result}")
-        endif()
-
-        if (enable_qt)
-            set(qt_hook_file "${appdir_path}/apprun-hooks/linuxdeploy-plugin-qt-hook.sh")
-            file(READ "${qt_hook_file}" qt_hook_contents)
-            # Add Cinnamon to list of DEs for GTK3 theming.
-            string(REPLACE
-                "*XFCE*"
-                "*X-Cinnamon*|*XFCE*"
-                qt_hook_contents "${qt_hook_contents}")
-            # Wayland backend crashes due to changed schemas in Gnome 40.
-            string(REPLACE
-                "export QT_QPA_PLATFORMTHEME=gtk3"
-                "export QT_QPA_PLATFORMTHEME=gtk3; export GDK_BACKEND=x11"
-                qt_hook_contents "${qt_hook_contents}")
-            file(WRITE "${qt_hook_file}" "${qt_hook_contents}")
+            message(FATAL_ERROR "linuxdeploy failed to create AppDir w/ exit code ${linuxdeploy_appdir_result}:\n${linuxdeploy_appdir_error}")
         endif()
 
         message(STATUS "Creating AppImage for executable ${executable_path}")
@@ -210,6 +198,10 @@ if (BUNDLE_TARGET_EXECUTE)
 
     # On Linux, always bundle an AppImage.
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+        if (IS_MINGW)
+            return()
+        endif()
+
         if (IN_PLACE)
             message(FATAL_ERROR "Cannot bundle for Linux in-place.")
         endif()
@@ -276,33 +268,32 @@ else()
         add_custom_target(bundle)
         add_custom_command(
             TARGET bundle
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bundle/")
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bundle/"
+            POST_BUILD)
         add_custom_command(
             TARGET bundle
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bundle/dist/")
-        add_custom_command(
-            TARGET bundle
-            COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/dist/icon.png" "${CMAKE_BINARY_DIR}/bundle/dist/citra.png")
-        add_custom_command(
-            TARGET bundle
-            COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/license.txt" "${CMAKE_BINARY_DIR}/bundle/")
-        add_custom_command(
-            TARGET bundle
-            COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/README.md" "${CMAKE_BINARY_DIR}/bundle/")
-        add_custom_command(
-            TARGET bundle
-            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/dist/scripting" "${CMAKE_BINARY_DIR}/bundle/scripting")
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/dist/scripting" "${CMAKE_BINARY_DIR}/bundle/scripting"
+            POST_BUILD)
 
         # On Linux, add a command to prepare linuxdeploy and any required plugins before any bundling occurs.
         if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
-            add_custom_command(
-                TARGET bundle
-                COMMAND ${CMAKE_COMMAND}
-                "-DBUNDLE_TARGET_DOWNLOAD_LINUXDEPLOY=1"
-                "-DLINUXDEPLOY_PATH=${CMAKE_BINARY_DIR}/externals/linuxdeploy"
-                "-DLINUXDEPLOY_ARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}"
-                -P "${CMAKE_SOURCE_DIR}/CMakeModules/BundleTarget.cmake"
-                WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+            if (MINGW)
+                add_custom_command(
+                        TARGET bundle
+                        # The target here is arbitrary
+                        COMMAND cp -r "$<TARGET_FILE_DIR:citra_meta>/*" "${CMAKE_BINARY_DIR}/bundle/"
+                        POST_BUILD)
+            else()
+                add_custom_command(
+                    TARGET bundle
+                    COMMAND ${CMAKE_COMMAND}
+                    "-DBUNDLE_TARGET_DOWNLOAD_LINUXDEPLOY=1"
+                    "-DLINUXDEPLOY_PATH=${CMAKE_BINARY_DIR}/externals/linuxdeploy"
+                    "-DLINUXDEPLOY_ARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}"
+                    -P "${CMAKE_SOURCE_DIR}/CMakeModules/BundleTarget.cmake"
+                    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+                    POST_BUILD)
+            endif()
         endif()
     endfunction()
 
@@ -312,6 +303,11 @@ else()
         # Create base bundle target if it does not exist.
         if (NOT in_place AND NOT TARGET bundle)
             create_base_bundle_target()
+        endif()
+
+        if (CMAKE_HOST_SYSTEM STREQUAL "Linux" AND MINGW)
+            # We don't really need to "bundle" MXE builds, so don't do anything
+            return()
         endif()
 
         set(bundle_executable_path "$<TARGET_FILE:${target_name}>")
@@ -352,6 +348,7 @@ else()
             "-DBUNDLE_LIBRARY_PATHS=\"${bundle_library_paths}\""
             "-DBUNDLE_QT=${bundle_qt}"
             "-DIN_PLACE=${in_place}"
+            "-DIS_MINGW=${MINGW}"
             "-DLINUXDEPLOY=${CMAKE_BINARY_DIR}/externals/linuxdeploy/squashfs-root/AppRun"
             -P "${CMAKE_SOURCE_DIR}/CMakeModules/BundleTarget.cmake"
             WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")

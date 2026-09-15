@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2024-2025 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -164,6 +164,8 @@ public:
     void SetPingEnabled(bool enable) {
         ping_enabled = enable;
     }
+
+    void LogOnServer(ArticBaseCommon::LogOnServerType log_type, const std::string& message);
 
 private:
     static constexpr const int SERVER_VERSION = 2;

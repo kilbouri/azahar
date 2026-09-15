@@ -10,14 +10,11 @@
     <height>458</height>
    </rect>
   </property>
-  <property name="windowTitle">
-   <string>Form</string>
-  </property>
   <layout class="QVBoxLayout" name="verticalLayout_1">
    <item>
     <layout class="QVBoxLayout" name="verticalLayout_2">
      <item>
-      <widget class="QGroupBox" name="groupBox">
+      <widget class="QGroupBox" name="gdb_groupbox">
        <property name="title">
         <string>GDB</string>
        </property>
@@ -59,6 +56,13 @@
            </widget>
           </item>
          </layout>
+        </item>
+        <item>
+          <widget class="QCheckBox" name="debug_next_process">
+            <property name="text">
+              <string>Pause next non-sysmodule process at start</string>
+            </property>
+          </widget>
         </item>
        </layout>
       </widget>
@@ -104,7 +108,7 @@
         <item>
          <widget class="QCheckBox" name="toggle_console">
           <property name="text">
-           <string>Show Log Console (Windows Only)</string>
+           <string>Show log output in console</string>
           </property>
          </widget>
         </item>
@@ -243,7 +247,14 @@
         </property>
        </widget>
       </item>
-      <item row="5" column="0">
+       <item row="5" column="0">
+         <widget class="QCheckBox" name="toggle_pica_debugging">
+           <property name="text">
+             <string>Enable PICA200 debugging</string>
+           </property>
+         </widget>
+       </item>
+      <item row="6" column="0">
        <widget class="QCheckBox" name="toggle_dump_command_buffers">
         <property name="text">
          <string>Dump command buffers</string>
@@ -270,12 +281,42 @@
        </widget>
       </item>
       <item row="2" column="0">
+       <widget class="QCheckBox" name="toggle_unique_data_console_type">
+        <property name="toolTip">
+         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Toggles the unique data console type (Old 3DS &#8596; New 3DS) to be able to download the opposite system firmware type from system settings.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+        </property>
+        <property name="text">
+         <string>Toggle unique data console type</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0">
        <widget class="QCheckBox" name="deterministic_async_operations">
         <property name="text">
          <string>Force deterministic async operations</string>
         </property>
         <property name="toolTip">
          <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Forces all async operations to run on the main thread, making them deterministic. Do not enable if you don't know what you are doing.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+        <widget class="QCheckBox" name="enable_rpc_server">
+          <property name="text">
+            <string>Enable RPC server</string>
+          </property>
+          <property name="toolTip">
+            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Enables the RPC server on port 45987. This allows remotely reading/writing guest memory, do not enable if you don't know what you are doing.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+          </property>
+        </widget>
+      </item>
+      <item row="5" column="0">
+       <widget class="QCheckBox" name="enable_exception_handler">
+        <property name="toolTip">
+         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Enables the exception handler. When an exception occurs a detailed crash report will be shown.&lt;/p&gt;&lt;p&gt;Note: When using CPU JIT, register values in the crash report may not be fully accurate because the JIT may have advanced past the fault. For more accurate reports, consider disabling CPU JIT.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+        </property>
+        <property name="text">
+         <string>Enable exception handler</string>
         </property>
        </widget>
       </item>

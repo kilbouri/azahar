@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2016-2025 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -52,6 +52,8 @@ private:
     void UpdateInitTicks(int init_ticks_type);
     void RefreshConsoleID();
     void RefreshMAC();
+    void UnlinkConsole();
+    void CheckCountryValid(u8 country);
 
     void InstallSecureData(const std::string& from_path, const std::string& to_path);
     void RefreshSecureDataStatus();

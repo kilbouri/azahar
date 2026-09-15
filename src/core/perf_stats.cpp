@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2017-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -29,6 +29,8 @@ constexpr std::size_t IgnoreFrames = 5;
 
 namespace Core {
 
+bool PerfStats::game_frames_updated = true;
+
 PerfStats::PerfStats(u64 title_id) : title_id(title_id) {}
 
 PerfStats::~PerfStats() {
@@ -46,6 +48,38 @@ PerfStats::~PerfStats() {
         fmt::format("{}/{:%F-%H-%M}_{:016X}.csv", path, *std::localtime(&t), title_id);
     FileUtil::IOFile file(filename, "w");
     file.WriteString(stream.str());
+}
+
+void PerfStats::BeginSVCProcessing() {
+    start_svc_time = Clock::now();
+}
+
+void PerfStats::EndSVCProcessing() {
+    accumulated_svc_time += (Clock::now() - start_svc_time);
+}
+
+void PerfStats::BeginIPCProcessing() {
+    start_ipc_time = Clock::now();
+}
+
+void PerfStats::EndIPCProcessing() {
+    accumulated_ipc_time += (Clock::now() - start_ipc_time);
+}
+
+void PerfStats::BeginGPUProcessing() {
+    start_gpu_time = Clock::now();
+}
+
+void PerfStats::EndGPUProcessing() {
+    accumulated_gpu_time += (Clock::now() - start_gpu_time);
+}
+
+void PerfStats::StartSwap() {
+    start_swap_time = Clock::now();
+}
+
+void PerfStats::EndSwap() {
+    accumulated_swap_time += (Clock::now() - start_swap_time);
 }
 
 void PerfStats::BeginSystemFrame() {
@@ -77,6 +111,7 @@ void PerfStats::EndGameFrame() {
     std::scoped_lock lock{object_mutex};
 
     game_frames += 1;
+    PerfStats::game_frames_updated = true;
 }
 
 double PerfStats::GetMeanFrametime() const {
@@ -102,8 +137,34 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
 
     last_stats.system_fps = static_cast<double>(system_frames) / interval;
     last_stats.game_fps = static_cast<double>(game_frames) / interval;
-    last_stats.frametime = duration_cast<DoubleSecs>(accumulated_frametime).count() /
-                           static_cast<double>(system_frames);
+    last_stats.time_vblank_interval =
+        system_frames ? (duration_cast<DoubleSecs>(accumulated_frametime).count() /
+                         static_cast<double>(system_frames))
+                      : 0;
+    last_stats.time_hle_svc =
+        system_frames
+            ? (duration_cast<DoubleSecs>(accumulated_svc_time - accumulated_ipc_time).count() /
+               static_cast<double>(system_frames))
+            : 0;
+    last_stats.time_hle_ipc =
+        system_frames
+            ? (duration_cast<DoubleSecs>(accumulated_ipc_time - accumulated_gpu_time).count() /
+               static_cast<double>(system_frames))
+            : 0;
+    last_stats.time_gpu = system_frames ? (duration_cast<DoubleSecs>(accumulated_gpu_time).count() /
+                                           static_cast<double>(system_frames))
+                                        : 0;
+    last_stats.time_swap = system_frames
+                               ? (duration_cast<DoubleSecs>(accumulated_swap_time).count() /
+                                  static_cast<double>(system_frames))
+                               : 0;
+
+    last_stats.time_remaining =
+        system_frames ? (duration_cast<DoubleSecs>((accumulated_frametime - accumulated_svc_time) -
+                                                   accumulated_swap_time)
+                             .count() /
+                         static_cast<double>(system_frames))
+                      : 0;
     last_stats.emulation_speed = system_us_per_second.count() / 1'000'000.0;
     last_stats.artic_transmitted = static_cast<double>(artic_transmitted) / interval;
     last_stats.artic_events.raw = artic_events.raw | prev_artic_event.raw;
@@ -113,6 +174,10 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
     reset_point_system_us = current_system_time_us;
     accumulated_frametime = Clock::duration::zero();
     system_frames = 0;
+    accumulated_svc_time = Clock::duration::zero();
+    accumulated_ipc_time = Clock::duration::zero();
+    accumulated_gpu_time = Clock::duration::zero();
+    accumulated_swap_time = Clock::duration::zero();
     game_frames = 0;
     artic_transmitted = 0;
     prev_artic_event.raw &= artic_events.raw;

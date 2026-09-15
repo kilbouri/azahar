@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -12,6 +12,7 @@
 #include <boost/optional.hpp>
 #include <boost/serialization/version.hpp>
 #include "common/common_types.h"
+#include "common/vector_math.h"
 #include "core/arm/arm_interface.h"
 #include "core/cheats/cheats.h"
 #include "core/hle/service/apt/applet_manager.h"
@@ -98,11 +99,16 @@ public:
                                         /// invalid format
         ErrorLoader_ErrorGbaTitle, ///< Error loading the specified application as it is GBA Virtual
                                    ///< Console
-        ErrorSystemFiles,          ///< Error in finding system files
-        ErrorSavestate,            ///< Error saving or loading
-        ErrorArticDisconnected,    ///< Error when artic base disconnects
-        ShutdownRequested,         ///< Emulated program requested a system shutdown
-        ErrorUnknown               ///< Any other error
+        ErrorLoader_ErrorPatches,  ///< Generic error while loading patches for an application
+        ErrorLoader_ErrorPatchesInvalidTitle, ///< A patch was loaded for the incorrect application
+        ErrorSystemFiles,                     ///< Error in finding system files
+        ErrorSavestate,                       ///< Error saving or loading
+        ErrorArticDisconnected,               ///< Error when artic base disconnects
+        ErrorN3DSApplication,        ///< Error launching New 3DS application in Old 3DS mode
+        ErrorCoreExceptionRaised,    ///< The CPU emulation raised an exception
+        ErrorSavestateBuildMismatch, ///< Tried to load savestate from a different Azahar version
+        ShutdownRequested,           ///< Emulated program requested a system shutdown
+        ErrorUnknown                 ///< Any other error
     };
 
     explicit System();
@@ -137,8 +143,9 @@ public:
     bool SendSignal(Signal signal, u32 param = 0);
 
     /// Request reset of the system
-    void RequestReset(const std::string& chainload = "") {
+    void RequestReset(const std::string& chainload = "", std::optional<u8> mem_mode = {}) {
         m_chainloadpath = chainload;
+        m_mem_mode = mem_mode;
         SendSignal(Signal::Reset);
     }
 
@@ -336,9 +343,14 @@ public:
     }
 
     /// Function for checking OS microphone permissions.
-
     void RegisterMicPermissionCheck(const std::function<bool()>& permission_func) {
         mic_permission_func = permission_func;
+    }
+
+    /// Fires the callback when System::Init() is called. Called with
+    /// true when initialization starts, and with false once its done.
+    void RegisterOnInitCallback(const std::function<void(bool)>& init_callback) {
+        on_init_callback = init_callback;
     }
 
     [[nodiscard]] bool HasMicPermission() {
@@ -360,21 +372,71 @@ public:
 
     void LoadState(u32 slot);
 
-    /// Self delete ncch
-    bool SetSelfDelete(const std::string& file) {
-        if (m_filepath == file) {
-            self_delete_pending = true;
-            return true;
-        }
-        return false;
-    }
+    std::vector<u8> SaveStateBuffer() const;
+
+    bool LoadStateBuffer(std::vector<u8> buffer);
 
     /// Applies any changes to settings to this core instance.
     void ApplySettings();
 
     void RegisterAppLoaderEarly(std::unique_ptr<Loader::AppLoader>& loader);
 
+    void InsertCartridge(const std::string& path);
+
+    void EjectCartridge();
+
+    const std::string& GetCartridge() const {
+        return inserted_cartridge;
+    }
+
     bool IsInitialSetup();
+
+    // This returns the 3DS notification LED RGB value.
+    // Keep in mind this is used as a PWM duty cycle on real HW,
+    // so the percieved LED brightness is not linear.
+    const Common::Vec3<u8>& GetInfoLEDColor() const {
+        return info_led_color;
+    }
+
+    void SetInfoLEDColor(const Common::Vec3<u8>& color) {
+        if (color == info_led_color)
+            return;
+
+        info_led_color = color;
+        if (info_led_color_changed) {
+            info_led_color_changed();
+        }
+    }
+
+    void RegisterInfoLEDColorChanged(const std::function<void()>& func) {
+        info_led_color_changed = func;
+    }
+
+    void SetDebugNextProcessFlag() {
+        debug_next_process = true;
+    }
+
+    bool GetDebugNextProcessFlag() {
+        return debug_next_process;
+    }
+
+    void ClearDebugNextProcessFlag() {
+        debug_next_process = false;
+    }
+
+    void DebugUnscheduleAllThreadsFromFrontend(bool unschedule);
+
+    void SetGDBPortOverride(int port) {
+        override_gdb_port = port;
+    }
+
+    void RegisterCoreLoopThreadId() {
+        core_loop_thread_id = std::this_thread::get_id();
+    }
+
+    std::thread::id GetCoreLoopThreadId() {
+        return core_loop_thread_id;
+    }
 
 private:
     /**
@@ -386,9 +448,7 @@ private:
      */
     [[nodiscard]] ResultStatus Init(Frontend::EmuWindow& emu_window,
                                     Frontend::EmuWindow* secondary_window,
-                                    Kernel::MemoryMode memory_mode,
-                                    const Kernel::New3dsHwCapabilities& n3ds_hw_caps,
-                                    u32 num_cores);
+                                    Kernel::MemoryMode memory_mode, u32 num_cores);
 
     /// Reschedule the core emulation
     void Reschedule();
@@ -399,6 +459,9 @@ private:
     // Temporary app loader passed from frontend
     std::unique_ptr<Loader::AppLoader> early_app_loader;
 
+    /// Path for current inserted cartridge
+    std::string inserted_cartridge;
+
     /// ARM11 CPU core
     std::vector<std::shared_ptr<ARM_Interface>> cpu_cores;
     ARM_Interface* running_core = nullptr;
@@ -407,7 +470,7 @@ private:
     std::unique_ptr<AudioCore::DspInterface> dsp_core;
 
     /// When true, signals that a reschedule should happen
-    bool reschedule_pending{};
+    bool curr_core_reschedule_pending{};
 
     std::unique_ptr<VideoCore::GPU> gpu;
 
@@ -463,8 +526,8 @@ private:
     Frontend::EmuWindow* m_secondary_window;
     std::string m_filepath;
     std::string m_chainloadpath;
+    std::optional<u8> m_mem_mode;
     u64 title_id;
-    bool self_delete_pending;
 
     std::mutex signal_mutex;
     Signal current_signal;
@@ -473,10 +536,23 @@ private:
     std::function<bool()> mic_permission_func;
     bool mic_permission_granted = false;
 
+    std::function<void(bool)> on_init_callback;
+
     boost::optional<Service::APT::DeliverArg> restore_deliver_arg;
+    boost::optional<Service::APT::SysMenuArg> restore_sys_menu_arg;
     boost::optional<Service::PLGLDR::PLG_LDR::PluginLoaderContext> restore_plugin_context;
+    std::unique_ptr<IPCDebugger::Recorder> restore_ipc_recorder;
+    std::vector<u8> restore_wireless_reboot_info;
 
     std::vector<u64> lle_modules;
+
+    Common::Vec3<u8> info_led_color;
+    std::function<void()> info_led_color_changed;
+
+    bool debug_next_process;
+    int override_gdb_port = -1;
+
+    std::thread::id core_loop_thread_id{};
 
     friend class boost::serialization::access;
     template <typename Archive>

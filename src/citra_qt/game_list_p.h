@@ -1,7 +1,6 @@
-// Copyright 2015 Citra Emulator Project
+// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
-
 #pragma once
 
 #include <algorithm>
@@ -18,11 +17,11 @@
 #include <QStandardItem>
 #include <QString>
 #include <QWidget>
-#include "citra_qt/play_time_manager.h"
 #include "citra_qt/uisettings.h"
 #include "citra_qt/util/util.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
+#include "common/play_time_manager.h"
 #include "common/string_util.h"
 #include "core/loader/smdh.h"
 
@@ -160,15 +159,18 @@ public:
     static constexpr int ExtdataIdRole = SortRole + 4;
     static constexpr int LongTitleRole = SortRole + 5;
     static constexpr int MediaTypeRole = SortRole + 6;
+    static constexpr int CanInsertRole = SortRole + 7;
 
     GameListItemPath() = default;
     GameListItemPath(const QString& game_path, std::span<const u8> smdh_data, u64 program_id,
-                     u64 extdata_id, Service::FS::MediaType media_type, bool is_encrypted) {
+                     u64 extdata_id, Service::FS::MediaType media_type, bool is_encrypted,
+                     bool can_insert) {
         setData(type(), TypeRole);
         setData(game_path, FullPathRole);
         setData(qulonglong(program_id), ProgramIdRole);
         setData(qulonglong(extdata_id), ExtdataIdRole);
         setData(quint32(media_type), MediaTypeRole);
+        setData(quint32(can_insert), CanInsertRole);
 
         if (UISettings::values.game_list_icon_size.GetValue() ==
             UISettings::GameListIconSize::NoIcon) {
@@ -265,7 +267,7 @@ public:
         };
         // clang-format off
         static const std::map<QString, CompatStatus> status_data = {
-        {QStringLiteral("0"),  {QStringLiteral("#5c93ed"), QT_TR_NOOP("Perfect"),    QT_TR_NOOP("App functions flawless with no audio or graphical glitches, all tested functionality works as intended without\nany workarounds needed.")}},
+        {QStringLiteral("0"),  {QStringLiteral("#5c93ed"), QT_TR_NOOP("Perfect"),    QT_TR_NOOP("App functions flawlessly with no audio or graphical glitches, all tested functionality works as intended without\nany workarounds needed.")}},
         {QStringLiteral("1"),  {QStringLiteral("#47d35c"), QT_TR_NOOP("Great"),      QT_TR_NOOP("App functions with minor graphical or audio glitches and is playable from start to finish. May require some\nworkarounds.")}},
         {QStringLiteral("2"),  {QStringLiteral("#94b242"), QT_TR_NOOP("Okay"),       QT_TR_NOOP("App functions with major graphical or audio glitches, but app is playable from start to finish with\nworkarounds.")}},
         {QStringLiteral("3"),  {QStringLiteral("#f2d624"), QT_TR_NOOP("Bad"),        QT_TR_NOOP("App functions, but with major graphical or audio glitches. Unable to progress in specific areas due to glitches\neven with workarounds.")}},
@@ -382,7 +384,7 @@ public:
 
     void setData(const QVariant& value, int role) override {
         qulonglong time_seconds = value.toULongLong();
-        GameListItem::setData(PlayTime::ReadablePlayTime(time_seconds), Qt::DisplayRole);
+        GameListItem::setData(ReadableDuration(time_seconds), Qt::DisplayRole);
         GameListItem::setData(value, PlayTimeRole);
     }
 

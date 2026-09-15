@@ -1,15 +1,15 @@
-// Copyright 2023 Citra Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
 package org.citra.citra_emu.features.settings.model
 
 import android.text.TextUtils
+import java.util.TreeMap
 import org.citra.citra_emu.CitraApplication
 import org.citra.citra_emu.R
 import org.citra.citra_emu.features.settings.ui.SettingsActivityView
 import org.citra.citra_emu.features.settings.utils.SettingsFile
-import java.util.TreeMap
 
 class Settings {
     private var gameId: String? = null
@@ -33,9 +33,7 @@ class Settings {
 
     var sections: HashMap<String, SettingSection?> = SettingsSectionMap()
 
-    fun getSection(sectionName: String): SettingSection? {
-        return sections[sectionName]
-    }
+    fun getSection(sectionName: String): SettingSection? = sections[sectionName]
 
     val isEmpty: Boolean
         get() = sections.isEmpty()
@@ -106,11 +104,15 @@ class Settings {
         const val SECTION_RENDERER = "Renderer"
         const val SECTION_LAYOUT = "Layout"
         const val SECTION_UTILITY = "Utility"
+        const val SECTION_NETWORK = "WebService"
         const val SECTION_AUDIO = "Audio"
         const val SECTION_DEBUG = "Debugging"
         const val SECTION_THEME = "Theme"
         const val SECTION_CUSTOM_LANDSCAPE = "Custom Landscape Layout"
         const val SECTION_CUSTOM_PORTRAIT = "Custom Portrait Layout"
+        const val SECTION_PERFORMANCE_OVERLAY = "Performance Overlay"
+        const val SECTION_STORAGE = "Storage"
+        const val SECTION_MISC = "Miscellaneous"
 
         const val KEY_BUTTON_A = "button_a"
         const val KEY_BUTTON_B = "button_b"
@@ -133,12 +135,15 @@ class Settings {
         const val KEY_CSTICK_AXIS_HORIZONTAL = "cstick_axis_horizontal"
         const val KEY_DPAD_AXIS_VERTICAL = "dpad_axis_vertical"
         const val KEY_DPAD_AXIS_HORIZONTAL = "dpad_axis_horizontal"
+        const val HOTKEY_ENABLE = "hotkey_enable"
         const val HOTKEY_SCREEN_SWAP = "hotkey_screen_swap"
         const val HOTKEY_CYCLE_LAYOUT = "hotkey_toggle_layout"
         const val HOTKEY_CLOSE_GAME = "hotkey_close_game"
         const val HOTKEY_PAUSE_OR_RESUME = "hotkey_pause_or_resume_game"
         const val HOTKEY_QUICKSAVE = "hotkey_quickload"
-        const val HOTKEY_QUICKlOAD = "hotkey_quickpause"
+        const val HOTKEY_QUICKLOAD = "hotkey_quickpause"
+        const val HOTKEY_TURBO_LIMIT = "hotkey_turbo_limit"
+        const val HOTKEY_BUTTON_COMBO = "hotkey_button_combo"
 
         val buttonKeys = listOf(
             KEY_BUTTON_A,
@@ -177,7 +182,7 @@ class Settings {
             KEY_BUTTON_RIGHT
         )
         val axisTitles = listOf(
-           R.string.controller_axis_vertical,
+            R.string.controller_axis_vertical,
             R.string.controller_axis_horizontal
         )
         val dPadTitles = listOf(
@@ -199,22 +204,29 @@ class Settings {
             R.string.button_zr
         )
         val hotKeys = listOf(
+            HOTKEY_ENABLE,
             HOTKEY_SCREEN_SWAP,
             HOTKEY_CYCLE_LAYOUT,
             HOTKEY_CLOSE_GAME,
             HOTKEY_PAUSE_OR_RESUME,
             HOTKEY_QUICKSAVE,
-            HOTKEY_QUICKlOAD
+            HOTKEY_QUICKLOAD,
+            HOTKEY_TURBO_LIMIT,
+            HOTKEY_BUTTON_COMBO
         )
         val hotkeyTitles = listOf(
+            R.string.controller_hotkey_enable_button,
             R.string.emulation_swap_screens,
             R.string.emulation_cycle_landscape_layouts,
             R.string.emulation_close_game,
             R.string.emulation_toggle_pause,
             R.string.emulation_quicksave,
             R.string.emulation_quickload,
+            R.string.turbo_limit_hotkey,
+            R.string.button_combo
         )
 
+        // TODO: Move these in with the other setting keys in GenerateSettingKeys.cmake
         const val PREF_FIRST_APP_LAUNCH = "FirstApplicationLaunch"
         const val PREF_MATERIAL_YOU = "MaterialYouTheme"
         const val PREF_THEME_MODE = "ThemeMode"
@@ -233,9 +245,12 @@ class Settings {
                     SECTION_CONTROLS,
                     SECTION_RENDERER,
                     SECTION_LAYOUT,
+                    SECTION_NETWORK,
+                    SECTION_STORAGE,
                     SECTION_UTILITY,
                     SECTION_AUDIO,
-                    SECTION_DEBUG
+                    SECTION_DEBUG,
+                    SECTION_MISC
                 )
         }
     }

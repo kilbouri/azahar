@@ -1,4 +1,4 @@
-// Copyright 2016 Citra Emulator Project
+// Copyright 2016-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -42,6 +42,9 @@ public:
     /// Resets internal state.
     void Reset();
 
+    void Sleep();
+    void Wakeup();
+
     /// Sets the memory system to read data from
     void SetMemory(Memory::MemorySystem& memory);
 
@@ -62,12 +65,13 @@ public:
      * @param dest The QuadFrame32 to mix into.
      * @param intermediate_mix_id The id of the intermediate mix whose gains we are using.
      */
-    void MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) const;
+    void MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id);
 
 private:
     const std::size_t source_id;
     Memory::MemorySystem* memory_system{};
     StereoFrame16 current_frame;
+    StereoFrame16 backup_frame; // TODO(PabloMK7): Check if we actually need this
 
     using Format = SourceConfiguration::Configuration::Format;
     using InterpolationMode = SourceConfiguration::Configuration::InterpolationMode;
@@ -116,7 +120,7 @@ private:
         }
     };
 
-    struct {
+    struct SourceState {
 
         // State variables
 
@@ -126,6 +130,8 @@ private:
         // Mixing
 
         std::array<std::array<float, 4>, 3> gain = {};
+        std::array<std::array<float, 4>, 3> gain_ramp_start = {};
+        std::array<bool, 3> gain_ramp_active = {};
 
         // Buffer queue
 
@@ -137,6 +143,10 @@ private:
 
         u32 current_sample_number = 0;
         PAddr current_buffer_physical_address = 0;
+        u32 current_buffer_length = 0;
+        MonoOrStereo current_buffer_mono_or_stereo = MonoOrStereo::Mono;
+        Format current_buffer_format = Format::ADPCM;
+        bool current_buffer_is_looping = false;
         AudioInterp::StereoBuffer16 current_buffer = {};
 
         // buffer_id state
@@ -166,11 +176,17 @@ private:
             ar & enabled;
             ar & sync_count;
             ar & gain;
+            ar & gain_ramp_start;
+            ar & gain_ramp_active;
             ar & input_queue;
             ar & mono_or_stereo;
             ar & format;
             ar & current_sample_number;
             ar & current_buffer_physical_address;
+            ar & current_buffer_length;
+            ar & current_buffer_mono_or_stereo;
+            ar & current_buffer_format;
+            ar & current_buffer_is_looping;
             ar & current_buffer;
             ar & buffer_update;
             ar & current_buffer_id;
@@ -179,8 +195,10 @@ private:
             ar & interpolation_mode;
         }
         friend class boost::serialization::access;
+    };
 
-    } state;
+    SourceState state;
+    SourceState backup_state;
 
     // Internal functions
 
@@ -197,6 +215,9 @@ private:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
         ar & state;
+        ar & backup_state;
+        ar & current_frame;
+        ar & backup_frame;
     }
     friend class boost::serialization::access;
 };

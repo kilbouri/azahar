@@ -1,10 +1,11 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2022-2025 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
 #pragma once
 
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -111,7 +112,14 @@ public:
 
     void Release();
 
+    void SetDebugName(std::string_view debug_name) {
+        this->debug_name = debug_name;
+    }
+
     GLuint handle = 0;
+
+private:
+    std::string debug_name = "Unk";
 };
 
 class OGLProgram : private NonCopyable {
@@ -139,7 +147,14 @@ public:
     /// Deletes the internal OpenGL resource
     void Release();
 
+    void SetDebugName(std::string_view debug_name) {
+        this->debug_name = debug_name;
+    }
+
     GLuint handle = 0;
+
+private:
+    std::string debug_name = "Unk";
 };
 
 class OGLPipeline : private NonCopyable {

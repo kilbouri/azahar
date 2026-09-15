@@ -1,4 +1,4 @@
-// Copyright 2023 Citra Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -98,13 +98,14 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, vk::Format fo
 } // Anonymous namespace
 
 PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& instance_,
-                             Scheduler& scheduler_)
+                             Scheduler& scheduler_, bool low_refresh_rate_)
     : emu_window{emu_window_}, instance{instance_}, scheduler{scheduler_},
+      low_refresh_rate{low_refresh_rate_},
       surface{CreateSurface(instance.GetInstance(), emu_window)}, next_surface{surface},
       swapchain{instance, emu_window.GetFramebufferLayout().width,
-                emu_window.GetFramebufferLayout().height, surface},
+                emu_window.GetFramebufferLayout().height, surface, low_refresh_rate_},
       graphics_queue{instance.GetGraphicsQueue()}, present_renderpass{CreateRenderpass()},
-      vsync_enabled{Settings::values.use_vsync_new.GetValue()},
+      vsync_enabled{Settings::values.use_vsync.GetValue()},
       blit_supported{
           CanBlitToSwapchain(instance.GetPhysicalDevice(), swapchain.GetSurfaceFormat().format)},
       use_present_thread{Settings::values.async_presentation.GetValue()},
@@ -154,6 +155,13 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
 PresentWindow::~PresentWindow() {
     scheduler.Finish();
     const vk::Device device = instance.GetDevice();
+    // If the window is destroyed before the next_surface is
+    // consumed, make sure to destroy it here to prevent a
+    // resource leak.
+    if (next_surface && next_surface != surface) {
+        instance.GetInstance().destroySurfaceKHR(next_surface);
+        next_surface = vk::SurfaceKHR{};
+    }
     device.destroyCommandPool(command_pool);
     device.destroyRenderPass(present_renderpass);
     for (auto& frame : swap_chain) {
@@ -339,6 +347,24 @@ void PresentWindow::PresentThread(std::stop_token token) {
 void PresentWindow::NotifySurfaceChanged() {
 #ifdef ANDROID
     std::scoped_lock lock{recreate_surface_mutex};
+
+    // surfaceChanged() may notify us that a surface has changed
+    // for the same surface multiple times. If that is the case
+    // skip creating the surface again as that would cause a
+    // vulkan ErrorNativeWindowInUseKHR.
+    void* const render_surface = emu_window.GetWindowInfo().render_surface;
+    if (render_surface == last_render_surface) {
+        return;
+    }
+    last_render_surface = render_surface;
+
+    // If an earlier notification produced a surface that CopyToSwapchain() has not consumed yet,
+    // release it rather than just overwritting its handle and causing a leak.
+    if (next_surface && next_surface != surface) {
+        instance.GetInstance().destroySurfaceKHR(next_surface);
+        next_surface = vk::SurfaceKHR{};
+    }
+
     next_surface = CreateSurface(instance.GetInstance(), emu_window);
     recreate_surface_cv.notify_one();
 #endif
@@ -355,11 +381,11 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
 #endif
         std::scoped_lock submit_lock{scheduler.submit_mutex};
         graphics_queue.waitIdle();
-        swapchain.Create(frame->width, frame->height, surface);
+        swapchain.Create(frame->width, frame->height, surface, low_refresh_rate);
     };
 
 #ifndef ANDROID
-    const bool use_vsync = Settings::values.use_vsync_new.GetValue();
+    const bool use_vsync = Settings::values.use_vsync.GetValue();
     const bool size_changed =
         swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
     const bool vsync_changed = vsync_enabled != use_vsync;
@@ -441,7 +467,8 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
                          vk::ImageLayout::eTransferDstOptimal,
                          MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
-                         vk::Filter::eLinear);
+                         Settings::values.filter_mode.GetValue() ? vk::Filter::eLinear
+                                                                 : vk::Filter::eNearest);
     } else {
         cmdbuf.copyImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
                          vk::ImageLayout::eTransferDstOptimal,

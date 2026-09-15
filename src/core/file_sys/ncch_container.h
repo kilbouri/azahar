@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -91,6 +91,10 @@ struct NCCH_Header {
     u8 reserved_4[4];
     u8 exefs_super_block_hash[0x20];
     u8 romfs_super_block_hash[0x20];
+
+    u32 GetContentUnitSize() {
+        return 0x200u * (1u << content_unit_size);
+    }
 };
 
 static_assert(sizeof(NCCH_Header) == 0x200, "NCCH header structure size is wrong");
@@ -178,7 +182,14 @@ struct ExHeader_ARM11_SystemLocalCaps {
         BitField<4, 4, u8> system_mode;
     };
     u8 priority;
-    u8 resource_limit_descriptor[0x10][2];
+    union {
+        u16 core1_schedule_flags;
+        BitField<0, 7, u16> max_cpu;
+        // Schedule mode flag, 0 -> "single", 1 -> "multi"
+        BitField<7, 1, u16> schedule_mode;
+        BitField<8, 8, u16> unknown;
+    };
+    u8 resource_limit_descriptor[0xF][2]; // Always 0 (unused?)
     ExHeader_StorageInfo storage_info;
     u8 service_access_control[0x20][8];
     u8 ex_service_access_control[0x2][8];
@@ -226,6 +237,9 @@ namespace FileSys {
  */
 class NCCHContainer {
 public:
+    static std::unique_ptr<FileUtil::IOFileBase> AutoOpenNCCHNCSD(const std::string& filepath);
+    static std::unique_ptr<FileUtil::IOFileBase> AutoOpenNCCHNCSD(FileUtil::IOFileBase* file);
+
     NCCHContainer(const std::string& filepath, u32 ncch_offset = 0, u32 partition = 0);
     NCCHContainer() {}
 
@@ -333,6 +347,14 @@ public:
      */
     bool HasExHeader();
 
+    bool IsNCSD() {
+        return is_ncsd;
+    }
+
+    bool IsFileCompressed() {
+        return file->GetType().HasCompressedType();
+    }
+
     NCCH_Header ncch_header;
     ExeFs_Header exefs_header;
     ExHeader_Header exheader_header;
@@ -343,18 +365,17 @@ private:
     bool has_exefs = false;
     bool has_romfs = false;
 
+    bool is_ncsd = false;
     bool is_proto = false;
     bool is_tainted = false; // Are there parts of this container being overridden?
     bool is_loaded = false;
     bool is_compressed = false;
 
-    u32 ncch_offset = 0; // Offset to NCCH header, can be 0 for NCCHs or non-zero for CIAs/NCSDs
-    u32 exefs_offset = 0;
     u32 partition = 0;
 
     std::string filepath;
-    std::unique_ptr<FileUtil::IOFile> file;
-    std::unique_ptr<FileUtil::IOFile> exefs_file;
+    std::unique_ptr<FileUtil::IOFileBase> file;
+    std::unique_ptr<FileUtil::IOFileBase> exefs_file;
 };
 
 } // namespace FileSys

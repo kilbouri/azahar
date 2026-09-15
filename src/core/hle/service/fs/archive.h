@@ -1,4 +1,4 @@
-// Copyright 2014 Citra Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -43,6 +43,9 @@ enum class ArchiveIdCode : u32 {
     SDMC = 0x00000009,
     SDMCWriteOnly = 0x0000000A,
     BossExtSaveData = 0x12345678,
+    NANDRW = 0x1234567D,
+    NANDRO = 0x1234567E,
+    NANDROW = 0x1234567F,
     NCCH = 0x2345678A,
     OtherSaveDataGeneral = 0x567890B2,
     OtherSaveDataPermitted = 0x567890B4,
@@ -51,6 +54,7 @@ enum class ArchiveIdCode : u32 {
 /// Media types for the archives
 enum class MediaType : u32 { NAND = 0, SDMC = 1, GameCard = 2 };
 
+bool IsInstalledApplication(std::string_view path);
 MediaType GetMediaTypeFromPath(std::string_view path);
 
 enum class SpecialContentType : u8 {

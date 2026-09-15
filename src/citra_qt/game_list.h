@@ -1,16 +1,17 @@
-// Copyright 2015 Citra Emulator Project
+// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
 #pragma once
 
 #include <QMenu>
+#include <QPushButton>
 #include <QString>
 #include <QVector>
 #include <QWidget>
 #include "citra_qt/compatibility_list.h"
-#include "citra_qt/play_time_manager.h"
 #include "common/common_types.h"
+#include "common/play_time_manager.h"
 #include "uisettings.h"
 
 namespace Service::FS {
@@ -106,6 +107,9 @@ signals:
     void AddDirectory();
     void ShowList(bool show);
     void PopulatingCompleted();
+#ifdef ENABLE_DEVELOPER_OPTIONS
+    void StartingLaunchStressTest(const QString& game_path);
+#endif
 
 private slots:
     void OnItemExpanded(const QModelIndex& item);
@@ -122,7 +126,7 @@ private:
     void PopupContextMenu(const QPoint& menu_location);
     void PopupHeaderContextMenu(const QPoint& menu_location);
     void AddGamePopup(QMenu& context_menu, const QString& path, const QString& name, u64 program_id,
-                      u64 extdata_id, Service::FS::MediaType media_type);
+                      u64 extdata_id, Service::FS::MediaType media_type, bool can_insert);
     void AddCustomDirPopup(QMenu& context_menu, QModelIndex selected);
     void AddPermDirPopup(QMenu& context_menu, QModelIndex selected);
     void AddFavoritesPopup(QMenu& context_menu);
@@ -145,6 +149,8 @@ private:
     friend class GameListSearchField;
 
     const PlayTime::PlayTimeManager& play_time_manager;
+
+    std::chrono::time_point<std::chrono::steady_clock> time_last_refresh;
 };
 
 class GameListPlaceholder : public QWidget {

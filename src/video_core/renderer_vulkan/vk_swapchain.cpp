@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -15,11 +15,12 @@ MICROPROFILE_DEFINE(Vulkan_Present, "Vulkan", "Swapchain Present", MP_RGB(66, 18
 
 namespace Vulkan {
 
-Swapchain::Swapchain(const Instance& instance_, u32 width, u32 height, vk::SurfaceKHR surface_)
+Swapchain::Swapchain(const Instance& instance_, u32 width, u32 height, vk::SurfaceKHR surface_,
+                     bool low_refresh_rate)
     : instance{instance_}, surface{surface_} {
     FindPresentFormat();
     SetPresentMode();
-    Create(width, height, surface);
+    Create(width, height, surface, low_refresh_rate);
 }
 
 Swapchain::~Swapchain() {
@@ -27,16 +28,24 @@ Swapchain::~Swapchain() {
     instance.GetInstance().destroySurfaceKHR(surface);
 }
 
-void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_) {
+void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_, bool low_refresh_rate_) {
     width = width_;
     height = height_;
     surface = surface_;
+    low_refresh_rate = low_refresh_rate_;
     needs_recreation = false;
 
     Destroy();
 
     SetPresentMode();
+    if (needs_recreation) {
+        return;
+    }
+
     SetSurfaceProperties();
+    if (needs_recreation) {
+        return;
+    }
 
     const std::array queue_family_indices = {
         instance.GetGraphicsQueueFamilyIndex(),
@@ -68,9 +77,13 @@ void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_) {
 
     try {
         swapchain = instance.GetDevice().createSwapchainKHR(swapchain_info);
+    } catch (vk::SurfaceLostKHRError&) {
+        LOG_ERROR(Render_Vulkan, "Surface lost during swapchain creation");
+        needs_recreation = true;
+        return;
     } catch (vk::SystemError& err) {
         LOG_CRITICAL(Render_Vulkan, "{}", err.what());
-        UNREACHABLE();
+        throw;
     }
 
     SetupImages();
@@ -158,8 +171,16 @@ void Swapchain::FindPresentFormat() {
 }
 
 void Swapchain::SetPresentMode() {
-    const auto modes = instance.GetPhysicalDevice().getSurfacePresentModesKHR(surface);
-    const bool use_vsync = Settings::values.use_vsync_new.GetValue();
+    std::vector<vk::PresentModeKHR> modes;
+    try {
+        modes = instance.GetPhysicalDevice().getSurfacePresentModesKHR(surface);
+    } catch (vk::SurfaceLostKHRError&) {
+        LOG_ERROR(Render_Vulkan, "Surface lost during swapchain creation");
+        needs_recreation = true;
+        return;
+    }
+
+    const bool use_vsync = Settings::values.use_vsync.GetValue();
     const auto find_mode = [&modes](vk::PresentModeKHR requested) {
         const auto it =
             std::find_if(modes.begin(), modes.end(),
@@ -183,9 +204,13 @@ void Swapchain::SetPresentMode() {
             has_immediate ? vk::PresentModeKHR::eImmediate : vk::PresentModeKHR::eMailbox;
         return;
     }
+
+    const auto frame_limit = Settings::GetFrameLimit();
+
     // If vsync is enabled attempt to use mailbox mode in case the user wants to speedup/slowdown
     // the game. If mailbox is not available use immediate and warn about it.
-    if (use_vsync && Settings::GetFrameLimit() > 100) {
+    if (use_vsync &&
+        (frame_limit > 100 || frame_limit == 0 || low_refresh_rate)) { // 0 = unthrottled
         present_mode = has_mailbox ? vk::PresentModeKHR::eMailbox : vk::PresentModeKHR::eImmediate;
         if (!has_mailbox) {
             LOG_WARNING(
@@ -197,8 +222,14 @@ void Swapchain::SetPresentMode() {
 }
 
 void Swapchain::SetSurfaceProperties() {
-    const vk::SurfaceCapabilitiesKHR capabilities =
-        instance.GetPhysicalDevice().getSurfaceCapabilitiesKHR(surface);
+    vk::SurfaceCapabilitiesKHR capabilities;
+    try {
+        capabilities = instance.GetPhysicalDevice().getSurfaceCapabilitiesKHR(surface);
+    } catch (vk::SurfaceLostKHRError&) {
+        LOG_ERROR(Render_Vulkan, "Surface lost during swapchain creation");
+        needs_recreation = true;
+        return;
+    }
 
     extent = capabilities.currentExtent;
     if (capabilities.currentExtent.width == std::numeric_limits<u32>::max()) {
@@ -231,6 +262,7 @@ void Swapchain::Destroy() {
     vk::Device device = instance.GetDevice();
     if (swapchain) {
         device.destroySwapchainKHR(swapchain);
+        swapchain = VK_NULL_HANDLE;
     }
     for (u32 i = 0; i < image_count; i++) {
         device.destroySemaphore(image_acquired[i]);

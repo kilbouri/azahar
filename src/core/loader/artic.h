@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2024-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -33,10 +33,10 @@ public:
      * @param file FileUtil::IOFile open file
      * @return FileType found, or FileType::Error if this loader doesn't know it
      */
-    static FileType IdentifyType(FileUtil::IOFile& file);
+    static FileType IdentifyType(FileUtil::IOFileBase* file);
 
     FileType GetFileType() override {
-        return IdentifyType(file);
+        return IdentifyType(file.get());
     }
 
     [[nodiscard]] std::span<const u32> GetPreferredRegions() const override {
@@ -55,6 +55,8 @@ public:
 
     std::pair<std::optional<Kernel::New3dsHwCapabilities>, ResultStatus> LoadNew3dsHwCapabilities()
         override;
+
+    bool IsN3DSExclusive() override;
 
     ResultStatus IsExecutable(bool& out_executable) override;
 
@@ -93,7 +95,7 @@ public:
     }
 
 private:
-    static constexpr u32 INITIAL_SETUP_APP_VERSION = 0;
+    static constexpr u32 SETUP_TOOL_VERSION = 2;
     /**
      * Loads .code section into memory for booting
      * @param process The newly created process

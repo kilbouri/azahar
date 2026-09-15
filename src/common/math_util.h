@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -9,7 +9,10 @@
 #pragma once
 
 #include <cstdlib>
+#include <span>
 #include <type_traits>
+#include <utility>
+#include "common_types.h"
 
 namespace Common {
 
@@ -55,6 +58,9 @@ struct Rectangle {
     [[nodiscard]] T GetHeight() const {
         return std::abs(static_cast<std::make_signed_t<T>>(bottom - top));
     }
+    [[nodiscard]] T GetArea() const {
+        return GetWidth() * GetHeight();
+    }
     [[nodiscard]] Rectangle<T> TranslateX(const T x) const {
         return Rectangle{left + x, top, right + x, bottom};
     }
@@ -72,5 +78,8 @@ struct Rectangle {
 
 template <typename T>
 Rectangle(T, T, T, T) -> Rectangle<T>;
+
+std::pair<u8, u8> FindMinMax(const std::span<const u8>& data);
+std::pair<u16, u16> FindMinMax(const std::span<const u16>& data);
 
 } // namespace Common

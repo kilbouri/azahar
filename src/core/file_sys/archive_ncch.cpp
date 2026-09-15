@@ -1,4 +1,4 @@
-// Copyright 2014 Citra Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -88,14 +88,31 @@ ResultVal<std::unique_ptr<FileBackend>> NCCHArchive::OpenFile(const Path& path, 
     std::memcpy(&openfile_path, binary.data(), sizeof(NCCHFilePath));
 
     std::string file_path;
-    if (Settings::values.is_new_3ds) {
-        // Try the New 3DS specific variant first.
-        file_path = Service::AM::GetTitleContentPath(media_type, title_id | 0x20000000,
-                                                     openfile_path.content_index);
-    }
-    if (!Settings::values.is_new_3ds || !FileUtil::Exists(file_path)) {
-        file_path =
-            Service::AM::GetTitleContentPath(media_type, title_id, openfile_path.content_index);
+
+    if (media_type == Service::FS::MediaType::GameCard) {
+        const auto& cartridge = Core::System::GetInstance().GetCartridge();
+        if (cartridge.empty()) {
+            return ResultNotFound;
+        }
+
+        u64 card_program_id;
+        auto cartridge_loader = Loader::GetLoader(cartridge);
+        FileSys::NCCHContainer cartridge_ncch(cartridge);
+        if (cartridge_ncch.ReadProgramId(card_program_id) != Loader::ResultStatus::Success ||
+            card_program_id != title_id) {
+            return ResultNotFound;
+        }
+        file_path = cartridge;
+    } else {
+        if (Settings::values.is_new_3ds) {
+            // Try the New 3DS specific variant first.
+            file_path = Service::AM::GetTitleContentPath(media_type, title_id | 0x20000000,
+                                                         openfile_path.content_index);
+        }
+        if (!Settings::values.is_new_3ds || !FileUtil::Exists(file_path)) {
+            file_path =
+                Service::AM::GetTitleContentPath(media_type, title_id, openfile_path.content_index);
+        }
     }
 
     auto ncch_container = NCCHContainer(file_path, 0, openfile_path.content_index);
@@ -116,6 +133,15 @@ ResultVal<std::unique_ptr<FileBackend>> NCCHArchive::OpenFile(const Path& path, 
 
         // Load NCCH .code or icon/banner/logo
         result = ncch_container.LoadSectionExeFS(openfile_path.exefs_filepath.data(), buffer);
+        if (result == Loader::ResultStatus::Success && Settings::values.apply_region_free_patch &&
+            std::memcmp(openfile_path.exefs_filepath.data(), "icon", 4) == 0 &&
+            buffer.size() >= sizeof(Loader::SMDH)) {
+            // Change the SMDH region lockout value to be region free
+            Loader::SMDH* smdh = reinterpret_cast<Loader::SMDH*>(buffer.data());
+            constexpr u32 REGION_LOCKOUT_REGION_FREE = 0x7FFFFFFF;
+
+            smdh->region_lockout = REGION_LOCKOUT_REGION_FREE;
+        }
         std::unique_ptr<DelayGenerator> delay_generator = std::make_unique<ExeFSDelayGenerator>();
         file = std::make_unique<NCCHFile>(std::move(buffer), std::move(delay_generator));
     } else {
@@ -133,6 +159,9 @@ ResultVal<std::unique_ptr<FileBackend>> NCCHArchive::OpenFile(const Path& path, 
         constexpr u32 region_manifest = 0x00010402;
         constexpr u32 ng_word_list = 0x00010302;
         constexpr u32 shared_font = 0x00014002;
+        constexpr u32 shared_font_CHN = 0x00014102;
+        constexpr u32 shared_font_KOR = 0x00014202;
+        constexpr u32 shared_font_TWN = 0x00014302;
 
         u32 high = static_cast<u32>(title_id >> 32);
         u32 low = static_cast<u32>(title_id & 0xFFFFFFFF);
@@ -156,6 +185,11 @@ ResultVal<std::unique_ptr<FileBackend>> NCCHArchive::OpenFile(const Path& path, 
                 LOG_WARNING(
                     Service_FS,
                     "Shared Font file missing. Loading open source replacement from memory");
+                archive_data =
+                    std::vector<u8>(std::begin(SHARED_FONT_DATA), std::end(SHARED_FONT_DATA));
+            } else if (low == shared_font_CHN || low == shared_font_KOR || low == shared_font_TWN) {
+                LOG_ERROR(Service_FS, "CHN/KOR/TWN shared font file missing. Loading open source "
+                                      "replacement, but text will not display properly");
                 archive_data =
                     std::vector<u8>(std::begin(SHARED_FONT_DATA), std::end(SHARED_FONT_DATA));
             }

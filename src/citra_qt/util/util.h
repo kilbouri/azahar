@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Lime3DS Emulator Project
+// Copyright 2015-2025 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -14,6 +14,9 @@ QFont GetMonospaceFont();
 
 /// Convert a size in bytes into a readable format (KiB, MiB, etc.)
 QString ReadableByteSize(qulonglong size);
+
+// Converts a length of time in seconds into a readable format
+QString ReadableDuration(qulonglong time_seconds);
 
 /**
  * Creates a circle pixmap from a specified color
@@ -41,3 +44,11 @@ QPixmap GetQPixmapFromSMDH(const std::vector<u8>& smdh_data);
  * @return The user’s applications directory
  */
 [[nodiscard]] const std::string GetApplicationsDirectory();
+
+/**
+ * Imitates the deprecated `QImage::mirrored` function in a forwards-compatible manner
+ * @param flip_horizontal Whether the image should be flipped horizontally
+ * @param flip_vertical Whether the image should be flipped vertically
+ * @return QImage The mirrored image
+ */
+QImage GetMirroredImage(QImage source_image, bool flip_horizontal, bool flip_vertical);

@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Lime3DS Emulator Project
+// Copyright 2019-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -6,6 +6,7 @@
 #include <QtGlobal>
 #include "citra_qt/configuration/configuration_shared.h"
 #include "citra_qt/configuration/configure_layout.h"
+#include "citra_qt/configuration/configure_layout_cycle.h"
 #include "common/settings.h"
 #include "ui_configure_layout.h"
 #ifdef ENABLE_OPENGL
@@ -98,8 +99,10 @@ ConfigureLayout::ConfigureLayout(QWidget* parent)
 #endif
 
     connect(ui->bg_button, &QPushButton::clicked, this, [this] {
+        ui->bg_button->setEnabled(false);
         const QColor new_bg_color = QColorDialog::getColor(bg_color);
         if (!new_bg_color.isValid()) {
+            ui->bg_button->setEnabled(true);
             return;
         }
         bg_color = new_bg_color;
@@ -107,6 +110,14 @@ ConfigureLayout::ConfigureLayout(QWidget* parent)
         pixmap.fill(bg_color);
         const QIcon color_icon(pixmap);
         ui->bg_button->setIcon(color_icon);
+        ui->bg_button->setEnabled(true);
+    });
+
+    connect(ui->customize_layouts_to_cycle, &QPushButton::clicked, this, [this] {
+        ui->customize_layouts_to_cycle->setEnabled(false);
+        QDialog* layout_cycle_dialog = new ConfigureLayoutCycle(this);
+        layout_cycle_dialog->exec();
+        ui->customize_layouts_to_cycle->setEnabled(true);
     });
 }
 
@@ -124,6 +135,7 @@ void ConfigureLayout::SetConfiguration() {
 
     ui->toggle_swap_screen->setChecked(Settings::values.swap_screen.GetValue());
     ui->toggle_upright_screen->setChecked(Settings::values.upright_screen.GetValue());
+    ui->screen_gap->setValue(Settings::values.screen_gap.GetValue());
     ui->large_screen_proportion->setValue(Settings::values.large_screen_proportion.GetValue());
     ui->small_screen_position_combobox->setCurrentIndex(
         static_cast<int>(Settings::values.small_screen_position.GetValue()));
@@ -163,6 +175,7 @@ void ConfigureLayout::RetranslateUI() {
 
 void ConfigureLayout::ApplyConfiguration() {
     Settings::values.large_screen_proportion = ui->large_screen_proportion->value();
+    Settings::values.screen_gap = ui->screen_gap->value();
     Settings::values.small_screen_position = static_cast<Settings::SmallScreenPosition>(
         ui->small_screen_position_combobox->currentIndex());
     Settings::values.custom_top_x = ui->custom_top_x->value();

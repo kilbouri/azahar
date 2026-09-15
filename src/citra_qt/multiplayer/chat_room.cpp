@@ -1,4 +1,4 @@
-// Copyright 2017 Citra Emulator Project
+// Copyright 2017-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -424,13 +424,6 @@ void ChatRoom::PopupContextMenu(const QPoint& menu_location) {
     QMenu context_menu;
 
     QString username = player_list->item(item.row())->data(PlayerListItem::UsernameRole).toString();
-    if (!username.isEmpty()) {
-        QAction* view_profile_action = context_menu.addAction(tr("View Profile"));
-        connect(view_profile_action, &QAction::triggered, [username] {
-            QDesktopServices::openUrl(
-                QUrl(QStringLiteral("https://community.citra-emu.org/u/%1").arg(username)));
-        });
-    }
 
     std::string cur_nickname;
     if (auto room = Network::GetRoomMember().lock()) {
@@ -459,11 +452,14 @@ void ChatRoom::PopupContextMenu(const QPoint& menu_location) {
         });
     }
 
-    if (has_mod_perms && nickname != cur_nickname) { // You can't kick or ban yourself
+    if (nickname != cur_nickname) { // You can't kick or ban yourself
         context_menu.addSeparator();
 
         QAction* kick_action = context_menu.addAction(tr("Kick"));
         QAction* ban_action = context_menu.addAction(tr("Ban"));
+
+        kick_action->setEnabled(has_mod_perms);
+        ban_action->setEnabled(has_mod_perms);
 
         connect(kick_action, &QAction::triggered, [this, nickname] {
             QMessageBox::StandardButton result =

@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2024-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -13,6 +13,10 @@ enum class HackType : int {
     ACCURATE_MULTIPLICATION,
     DECRYPTION_AUTHORIZED,
     ONLINE_LLE_REQUIRED,
+    REGION_FROM_SECURE,
+    REQUIRES_SHADER_FIXUP,
+    SPOOF_FRIEND_CODE_SEED,
+    DELAY_TEXTURE_COPY_COMPLETION,
 };
 
 class UserHackData {};

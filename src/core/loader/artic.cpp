@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2024-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -80,7 +80,7 @@ Apploader_Artic::~Apploader_Artic() {
     client->Stop();
 }
 
-FileType Apploader_Artic::IdentifyType(FileUtil::IOFile& file) {
+FileType Apploader_Artic::IdentifyType(FileUtil::IOFileBase* file) {
     return FileType::ARTIC;
 }
 
@@ -132,6 +132,16 @@ Apploader_Artic::LoadNew3dsHwCapabilities() {
         static_cast<Kernel::New3dsMemoryMode>(ncch_caps.n3ds_mode),
     };
     return std::make_pair(std::move(caps), ResultStatus::Success);
+}
+
+bool Apploader_Artic::IsN3DSExclusive() {
+    std::vector<u8> smdh_buffer;
+    if (ReadIcon(smdh_buffer) == ResultStatus::Success && IsValidSMDH(smdh_buffer)) {
+        SMDH* smdh = reinterpret_cast<SMDH*>(smdh_buffer.data());
+        return smdh->flags.n3ds_exclusive != 0;
+    }
+
+    return false;
 }
 
 ResultStatus Apploader_Artic::LoadExec(std::shared_ptr<Kernel::Process>& process) {
@@ -192,6 +202,14 @@ ResultStatus Apploader_Artic::LoadExecImpl(std::shared_ptr<Kernel::Process>& pro
     const auto category = static_cast<Kernel::ResourceLimitCategory>(
         exheader.arm11_system_local_caps.resource_limit_category);
     process->resource_limit = system.Kernel().ResourceLimit().GetForCategory(category);
+
+    // Update application max cpu setting. PM module uses the launch flags to determine
+    // this, but using the resource limit category is close enough.
+    if (category == Kernel::ResourceLimitCategory::Application) {
+        process->resource_limit->ApplyAppMaxCPUSetting(
+            process, exheader.arm11_system_local_caps.schedule_mode,
+            exheader.arm11_system_local_caps.max_cpu);
+    }
 
     // When running N3DS-unaware titles pm will lie about the amount of memory available.
     // This means RESLIMIT_COMMIT = APPMEMALLOC doesn't correspond to the actual size of
@@ -342,7 +360,8 @@ void Apploader_Artic::EnsureClientConnected() {
 
     if (is_initial_setup) {
         // Ensure we are running the initial setup app in the correct version
-        auto req = client->NewRequest("System_IsAzaharInitialSetup");
+        auto req = client->NewRequest("System_ArticSetupVersion");
+        req.AddParameterU32(SETUP_TOOL_VERSION);
         auto resp = client->Send(req);
         if (!resp.has_value()) {
             client_connected = false;
@@ -355,7 +374,15 @@ void Apploader_Artic::EnsureClientConnected() {
             return;
         }
 
-        client_connected = *reinterpret_cast<u32*>(ret_buf->first) == INITIAL_SETUP_APP_VERSION;
+        if (*reinterpret_cast<u32*>(ret_buf->first) != SETUP_TOOL_VERSION) {
+            system.SetStatus(Core::System::ResultStatus::ErrorArticDisconnected,
+                             "\nIncompatible Artic Setup Tool version.\nCheck for Artic Setup Tool "
+                             "or Azahar updates.");
+            client_connected = false;
+            client->Stop();
+        } else {
+            client_connected = true;
+        }
     }
 }
 
@@ -385,6 +412,21 @@ ResultStatus Apploader_Artic::Load(std::shared_ptr<Kernel::Process>& process) {
 
     if (is_initial_setup) {
 
+        // If there is already a console linked, check it's the same device.
+        // Otherwise it could cause weird issues with account save data.
+        if (HW::UniqueData::IsFullConsoleLinked()) {
+            auto req = client->NewRequest("System_ReportDeviceID");
+            req.AddParameterU32(HW::UniqueData::GetOTP().GetDeviceID());
+
+            auto resp = client->Send(req);
+            if (!resp.has_value() || !resp->Succeeded())
+                return ResultStatus::ErrorArtic;
+
+            if (resp->GetMethodResult() != 0)
+                return ResultStatus::ErrorArtic;
+        }
+
+        auto cfg = system.ServiceManager().GetService<Service::CFG::CFG_U>("cfg:u");
         // Request console unique data
         for (int i = 0; i < 6; i++) {
             std::string path;
@@ -448,7 +490,6 @@ ResultStatus Apploader_Artic::Load(std::shared_ptr<Kernel::Process>& process) {
                 memcpy(&console_id, resp_buff->first, sizeof(u64));
                 memcpy(&random_id, reinterpret_cast<u8*>(resp_buff->first) + sizeof(u64),
                        sizeof(u32));
-                auto cfg = system.ServiceManager().GetService<Service::CFG::CFG_U>("cfg:u");
                 if (cfg.get()) {
                     auto cfg_module = cfg->GetModule();
                     cfg_module->SetConsoleUniqueId(random_id, console_id);
@@ -457,7 +498,6 @@ ResultStatus Apploader_Artic::Load(std::shared_ptr<Kernel::Process>& process) {
             } else if (i == 5) {
                 std::array<u8, 6> mac;
                 memcpy(mac.data(), resp_buff->first, mac.size());
-                auto cfg = system.ServiceManager().GetService<Service::CFG::CFG_U>("cfg:u");
                 if (cfg.get()) {
                     auto cfg_module = cfg->GetModule();
                     cfg_module->GetMacAddress() = Service::CFG::MacToString(mac);
@@ -471,8 +511,23 @@ ResultStatus Apploader_Artic::Load(std::shared_ptr<Kernel::Process>& process) {
         if (!HW::UniqueData::GetCTCert().IsValid() || !HW::UniqueData::GetMovableSed().IsValid() ||
             !HW::UniqueData::GetSecureInfoA().IsValid() ||
             !HW::UniqueData::GetLocalFriendCodeSeedB().IsValid()) {
-            LOG_CRITICAL(Loader, "Some console unique data is invalid, aborting...");
+            client->LogOnServer(Network::ArticBaseCommon::LogOnServerType::LOG_ERROR,
+                                "Some console unique data is invalid.\n    Aborting...");
             return ResultStatus::ErrorArtic;
+        }
+
+        if (cfg.get()) {
+            auto cfg_module = cfg->GetModule();
+            if (!Service::CFG::Module::IsValidRegionCountry(cfg_module->GetRegionValue(true),
+                                                            cfg_module->GetCountryCode())) {
+                // Report mismatch to server.
+                client->LogOnServer(
+                    Network::ArticBaseCommon::LogOnServerType::LOG_ERROR,
+                    "The country configuration does not match\n    the console region. "
+                    "Please select a valid\n    country from the emulation settings.");
+                return ResultStatus::ErrorArtic;
+            }
+            cfg_module->SetSystemSetupNeeded(false);
         }
 
         // Set deliver arg so that System Settings goes to the update screen directly

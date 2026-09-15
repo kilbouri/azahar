@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -21,9 +21,11 @@
 #include <QTranslator>
 #include "citra_qt/compatibility_list.h"
 #include "citra_qt/hotkeys.h"
+#include "citra_qt/notification_led.h"
 #include "citra_qt/user_data_migration.h"
 #include "core/core.h"
 #include "core/savestate.h"
+#include "video_core/rasterizer_interface.h"
 
 // Needs to be included at the end due to https://bugreports.qt.io/browse/QTBUG-73263
 #include <filesystem>
@@ -65,9 +67,11 @@ namespace Camera {
 class QtMultimediaCameraHandlerFactory;
 }
 
+#ifdef ENABLE_DISCORD_RPC
 namespace DiscordRPC {
 class DiscordInterface;
 }
+#endif
 
 namespace PlayTime {
 class PlayTimeManager;
@@ -89,7 +93,7 @@ namespace Service::FS {
 enum class MediaType : u32;
 }
 
-void LaunchQtFrontend(int argc, char* argv[]);
+int LaunchQtFrontend(int argc, char* argv[]);
 
 class GMainWindow : public QMainWindow {
     Q_OBJECT
@@ -106,7 +110,9 @@ public:
 
     GameList* game_list;
     std::unique_ptr<PlayTime::PlayTimeManager> play_time_manager;
+#ifdef ENABLE_DISCORD_RPC
     std::unique_ptr<DiscordRPC::DiscordInterface> discord_rpc;
+#endif
 
     bool DropAction(QDropEvent* event);
     void AcceptDropEvent(QDropEvent* event);
@@ -140,9 +146,12 @@ signals:
 
     void UpdateProgress(std::size_t written, std::size_t total);
     void CIAInstallReport(Service::AM::InstallStatus status, QString filepath);
+    void CompressFinished(bool is_compress, bool success);
     void CIAInstallFinished();
+    void InfoLEDColorChanged();
     // Signal that tells widgets to update icons to use the current theme
     void UpdateThemedIcons();
+    void InstalledTitlesChanged();
 
 private:
     void InitializeWidgets();
@@ -166,7 +175,9 @@ private:
     void BootGame(const QString& filename);
     void ShutdownGame();
 
+#ifdef ENABLE_DISCORD_RPC
     void SetDiscordEnabled(bool state);
+#endif
     void LoadAmiibo(const QString& filename);
 
     /**
@@ -221,7 +232,7 @@ private:
     void ShowFFmpegErrorMessage();
 
 private slots:
-    void OnStartGame();
+    void OnResumeGame(bool first_start);
     void OnRestartGame();
     void OnPauseGame();
     void OnPauseContinueGame();
@@ -247,12 +258,15 @@ private slots:
     void OnMenuBootHomeMenu(u32 region);
     void OnUpdateProgress(std::size_t written, std::size_t total);
     void OnCIAInstallReport(Service::AM::InstallStatus status, QString filepath);
+    void OnCompressFinished(bool is_compress, bool success);
     void OnCIAInstallFinished();
     void OnMenuRecentFile();
     void OnConfigure();
     void OnLoadAmiibo();
     void OnRemoveAmiibo();
     void OnOpenCitraFolder();
+    void OnOpenNANDFolder();
+    void OnOpenSDMCFolder();
     void OnToggleFilterBar();
     void OnDisplayTitleBars(bool);
     void InitializeHotkeys();
@@ -260,6 +274,10 @@ private slots:
     void ToggleSecondaryFullscreen();
     void ChangeScreenLayout();
     void ChangeSmallScreenPosition();
+    bool IsTurboEnabled();
+    void SetTurboEnabled(bool);
+    void ReloadTurbo();
+    void AdjustSpeedLimit(bool increase);
     void UpdateSecondaryWindowVisibility();
     void ToggleScreenLayout();
     void OnSwapScreens();
@@ -276,6 +294,8 @@ private slots:
     void OnSaveMovie();
     void OnCaptureScreenshot();
     void OnDumpVideo();
+    void OnCompressFile();
+    void OnDecompressFile();
 #ifdef _WIN32
     void OnOpenFFmpeg();
 #endif
@@ -283,6 +303,7 @@ private slots:
     void StartVideoDumping(const QString& path);
     void OnStopVideoDumping();
     void OnCoreError(Core::System::ResultStatus, std::string);
+    bool ShowExceptionDialog(Core::System::ResultStatus result, const std::string& details);
     /// Called whenever a user selects Help->About Azahar
     void OnMenuAboutCitra();
 
@@ -294,6 +315,11 @@ private slots:
     void OnMute();
 #ifdef ENABLE_QT_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
+#endif
+    void OnSwitchDiskResources(VideoCore::LoadCallbackStage stage, std::size_t value,
+                               std::size_t total, const std::string& object);
+#ifdef ENABLE_DEVELOPER_OPTIONS
+    void StartLaunchStressTest(const QString& game_path);
 #endif
 
 private:
@@ -330,6 +356,7 @@ private:
     QProgressBar* progress_bar = nullptr;
     QLabel* message_label = nullptr;
     bool show_artic_label = false;
+    QLabel* loading_shaders_label = nullptr;
     QLabel* artic_traffic_label = nullptr;
     QLabel* emu_speed_label = nullptr;
     QLabel* game_fps_label = nullptr;
@@ -343,10 +370,15 @@ private:
 
     MultiplayerState* multiplayer_state = nullptr;
 
+    LedWidget* notification_led = nullptr;
+
     // Created before `config` to ensure that emu data directory
     // isn't created before the check is performed
     UserDataMigrator user_data_migrator;
     std::unique_ptr<QtConfig> config;
+
+    // Hotkeys
+    bool turbo_mode_active = false;
 
     // Whether emulation is currently running in Citra.
     bool emulation_running = false;
@@ -378,23 +410,25 @@ private:
     // Whether game was paused due to stopping video dumping
     bool game_paused_for_dumping = false;
 
+    int gdbport_from_arg = -1;
+
     QString gl_renderer;
     std::vector<QString> physical_devices;
 
     // Debugger panes
-    ProfilerWidget* profilerWidget;
+    ProfilerWidget* profilerWidget{};
 #if MICROPROFILE_ENABLED
-    MicroProfileDialog* microProfileDialog;
+    MicroProfileDialog* microProfileDialog{};
 #endif
-    RegistersWidget* registersWidget;
-    GPUCommandStreamWidget* graphicsWidget;
-    GPUCommandListWidget* graphicsCommandsWidget;
-    GraphicsBreakPointsWidget* graphicsBreakpointsWidget;
-    GraphicsVertexShaderWidget* graphicsVertexShaderWidget;
-    GraphicsTracingWidget* graphicsTracingWidget;
-    IPCRecorderWidget* ipcRecorderWidget;
-    LLEServiceModulesWidget* lleServiceModulesWidget;
-    WaitTreeWidget* waitTreeWidget;
+    RegistersWidget* registersWidget{};
+    GPUCommandStreamWidget* graphicsWidget{};
+    GPUCommandListWidget* graphicsCommandsWidget{};
+    GraphicsBreakPointsWidget* graphicsBreakpointsWidget{};
+    GraphicsVertexShaderWidget* graphicsVertexShaderWidget{};
+    GraphicsTracingWidget* graphicsTracingWidget{};
+    IPCRecorderWidget* ipcRecorderWidget{};
+    LLEServiceModulesWidget* lleServiceModulesWidget{};
+    WaitTreeWidget* waitTreeWidget{};
 
     QAction* actions_recent_files[max_recent_files_item];
     std::array<QAction*, Core::SaveStateSlotCount> actions_load_state;
@@ -411,7 +445,8 @@ private:
     QAction* action_secondary_swap_screen;
     QAction* action_secondary_rotate_screen;
 
-    QTranslator translator;
+    QTranslator qtTranslator;
+    QTranslator citraTranslator;
 
     // stores default icon theme search paths for the platform
     QStringList default_theme_paths;
@@ -420,8 +455,8 @@ private:
 
     std::shared_ptr<Camera::QtMultimediaCameraHandlerFactory> qt_cameras;
 
-    // Prompt shown when update check succeeds
 #ifdef ENABLE_QT_UPDATE_CHECKER
+    // Prompt shown when update check succeeds
     QFuture<QString> update_future;
     QFutureWatcher<QString> update_watcher;
 #endif
@@ -437,6 +472,7 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 };
 
 class GApplicationEventFilter : public QObject {

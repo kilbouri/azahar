@@ -1,4 +1,4 @@
-// Copyright 2023 Citra Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -63,11 +63,15 @@ static std::unique_ptr<Pica::ShaderSetup> CompileShaderSetup(
     const auto shbin = nihstro::InlineAsm::CompileToRawBinary(code);
 
     auto shader = std::make_unique<Pica::ShaderSetup>();
-
-    std::transform(shbin.program.begin(), shbin.program.end(), shader->program_code.begin(),
+    Pica::ProgramCode program_code{};
+    Pica::SwizzleData swizzle_data{};
+    std::transform(shbin.program.begin(), shbin.program.end(), program_code.begin(),
                    [](const auto& x) { return x.hex; });
-    std::transform(shbin.swizzle_table.begin(), shbin.swizzle_table.end(),
-                   shader->swizzle_data.begin(), [](const auto& x) { return x.hex; });
+    std::transform(shbin.swizzle_table.begin(), shbin.swizzle_table.end(), swizzle_data.begin(),
+                   [](const auto& x) { return x.hex; });
+
+    shader->UpdateProgramCode(program_code);
+    shader->UpdateSwizzleData(swizzle_data);
 
     return shader;
 }
@@ -88,8 +92,10 @@ public:
     Common::Vec4f Run(std::span<const Common::Vec4f> inputs) {
         Pica::ShaderUnit shader_unit;
         RunShader(shader_unit, inputs);
-        return {shader_unit.output[0].x.ToFloat32(), shader_unit.output[0].y.ToFloat32(),
-                shader_unit.output[0].z.ToFloat32(), shader_unit.output[0].w.ToFloat32()};
+        return {shader_unit.output[shader_unit.output_bank][0].x.ToFloat32(),
+                shader_unit.output[shader_unit.output_bank][0].y.ToFloat32(),
+                shader_unit.output[shader_unit.output_bank][0].z.ToFloat32(),
+                shader_unit.output[shader_unit.output_bank][0].w.ToFloat32()};
     }
 
     Common::Vec4f Run(std::initializer_list<float> inputs) {
@@ -143,12 +149,16 @@ private:
 class ShaderJitTest : public ShaderTest {
 public:
     explicit ShaderJitTest(std::initializer_list<nihstro::InlineAsm> code) : ShaderTest(code) {
-        shader_jit.Compile(&shader_setup->program_code, &shader_setup->swizzle_data);
+        const auto& program_code = shader_setup->GetProgramCode();
+        const auto& swizzle_data = shader_setup->GetSwizzleData();
+        shader_jit.Compile(&program_code, &swizzle_data);
     }
 
     explicit ShaderJitTest(std::unique_ptr<Pica::ShaderSetup> input_shader_setup)
         : ShaderTest(std::move(input_shader_setup)) {
-        shader_jit.Compile(&shader_setup->program_code, &shader_setup->swizzle_data);
+        const auto& program_code = shader_setup->GetProgramCode();
+        const auto& swizzle_data = shader_setup->GetSwizzleData();
+        shader_jit.Compile(&program_code, &swizzle_data);
     }
 
     void RunShader(Pica::ShaderUnit& shader_unit, std::span<const Common::Vec4f> inputs) override {
@@ -210,12 +220,12 @@ SHADER_TEST_CASE("CALL", "[video_core][shader]") {
     // call foo
     CALL.flow_control.dest_offset = 2;
     CALL.flow_control.num_instructions = 1;
-    shader_setup->program_code[0] = CALL.hex;
+    shader_setup->UpdateProgramCode(0, CALL.hex);
 
     // call ex2
     CALL.flow_control.dest_offset = 4;
     CALL.flow_control.num_instructions = 1;
-    shader_setup->program_code[2] = CALL.hex;
+    shader_setup->UpdateProgramCode(2, CALL.hex);
 
     auto shader = TestType(std::move(shader_setup));
 
@@ -473,6 +483,39 @@ SHADER_TEST_CASE("RSQ", "[video_core][shader]") {
     REQUIRE(shader.Run({0.0625f}).x == Catch::Approx(4.0f).margin(0.004f));
 }
 
+SHADER_TEST_CASE("SETEMIT", "[video_core][shader]") {
+    Pica::GeometryEmitter geometry_emitter;
+
+    for (u8 winding = 0; winding <= 1; ++winding) {
+        for (u8 prim_emit = 0; prim_emit <= 1; ++prim_emit) {
+            for (u8 vertex_id = 0; vertex_id <= 3; ++vertex_id) {
+                auto shader_setup = CompileShaderSetup({
+                    {OpCode::Id::NOP}, // setemit
+                    {OpCode::Id::END},
+                });
+
+                // nihstro does not support the SETEMIT instructions, so the instruction-binary must
+                // be manually
+                // inserted here:
+                nihstro::Instruction SETEMIT = {};
+                SETEMIT.opcode = nihstro::OpCode(nihstro::OpCode::Id::SETEMIT);
+                SETEMIT.setemit.winding.Assign(winding);
+                SETEMIT.setemit.prim_emit.Assign(prim_emit);
+                SETEMIT.setemit.vertex_id.Assign(vertex_id);
+                shader_setup->UpdateProgramCode(0, SETEMIT.hex);
+
+                auto shader = TestType(std::move(shader_setup));
+                Pica::ShaderUnit shader_unit(&geometry_emitter);
+                shader.Run(shader_unit, 1.0f);
+
+                REQUIRE(geometry_emitter.emit_state.winding == winding);
+                REQUIRE(geometry_emitter.emit_state.prim_emit == prim_emit);
+                REQUIRE(geometry_emitter.emit_state.vertex_id == vertex_id);
+            }
+        }
+    }
+}
+
 SHADER_TEST_CASE("Uniform Read", "[video_core][shader]") {
     const auto sh_input = SourceRegister::MakeInput(0);
     const auto sh_c0 = SourceRegister::MakeFloat(0);
@@ -608,7 +651,7 @@ SHADER_TEST_CASE("MAD", "[video_core][shader]") {
     MAD.mad.src2 = sh_input2;
     MAD.mad.src3 = sh_input3;
     MAD.mad.dest = sh_output;
-    shader_setup->program_code[0] = MAD.hex;
+    shader_setup->UpdateProgramCode(0, MAD.hex);
 
     nihstro::SwizzlePattern swizzle = {};
     swizzle.dest_mask = 0b1111;
@@ -624,7 +667,7 @@ SHADER_TEST_CASE("MAD", "[video_core][shader]") {
     swizzle.SetSelectorSrc3(1, SwizzlePattern::Selector::y);
     swizzle.SetSelectorSrc3(2, SwizzlePattern::Selector::z);
     swizzle.SetSelectorSrc3(3, SwizzlePattern::Selector::w);
-    shader_setup->swizzle_data[0] = swizzle.hex;
+    shader_setup->UpdateSwizzleData(0, swizzle.hex);
 
     auto shader = TestType(std::move(shader_setup));
 
@@ -670,7 +713,8 @@ TEMPLATE_TEST_CASE("Nested Loop", "[video_core][shader]", ShaderJitTest) {
         shader_test.Run(shader_unit, input);
 
         REQUIRE(shader_unit.address_registers[2] == expected_aL);
-        REQUIRE(shader_unit.output[0].x.ToFloat32() == Catch::Approx(expected_out));
+        REQUIRE(shader_unit.output[shader_unit.output_bank][0].x.ToFloat32() ==
+                Catch::Approx(expected_out));
     }
 }
 
@@ -713,52 +757,52 @@ SHADER_TEST_CASE("Conditional", "[video_core][shader]") {
     {
         auto shader_setup = CompileShaderSetup(assembly_template);
         IFC.flow_control.op = nihstro::Instruction::FlowControlType::Op::JustX;
-        shader_setup->program_code[0] = IFC.hex;
+        shader_setup->UpdateProgramCode(0, IFC.hex);
         const float result = result_x ? 1.0f : 0.0f;
 
         auto shader_test = TestType(std::move(shader_setup));
         shader_test.Run(shader_unit, 1.0f);
 
-        REQUIRE(shader_unit.output[0].x.ToFloat32() == result);
+        REQUIRE(shader_unit.output[shader_unit.output_bank][0].x.ToFloat32() == result);
     }
 
     // JustY
     {
         auto shader_setup = CompileShaderSetup(assembly_template);
         IFC.flow_control.op = nihstro::Instruction::FlowControlType::Op::JustY;
-        shader_setup->program_code[0] = IFC.hex;
+        shader_setup->UpdateProgramCode(0, IFC.hex);
         const float result = result_y ? 1.0f : 0.0f;
 
         auto shader_test = TestType(std::move(shader_setup));
         shader_test.Run(shader_unit, 1.0f);
 
-        REQUIRE(shader_unit.output[0].x.ToFloat32() == result);
+        REQUIRE(shader_unit.output[shader_unit.output_bank][0].x.ToFloat32() == result);
     }
 
     // OR
     {
         auto shader_setup = CompileShaderSetup(assembly_template);
         IFC.flow_control.op = nihstro::Instruction::FlowControlType::Op::Or;
-        shader_setup->program_code[0] = IFC.hex;
+        shader_setup->UpdateProgramCode(0, IFC.hex);
         const float result = (result_x || result_y) ? 1.0f : 0.0f;
 
         auto shader_test = TestType(std::move(shader_setup));
         shader_test.Run(shader_unit, 1.0f);
 
-        REQUIRE(shader_unit.output[0].x.ToFloat32() == result);
+        REQUIRE(shader_unit.output[shader_unit.output_bank][0].x.ToFloat32() == result);
     }
 
     // AND
     {
         auto shader_setup = CompileShaderSetup(assembly_template);
         IFC.flow_control.op = nihstro::Instruction::FlowControlType::Op::And;
-        shader_setup->program_code[0] = IFC.hex;
+        shader_setup->UpdateProgramCode(0, IFC.hex);
         const float result = (result_x && result_y) ? 1.0f : 0.0f;
 
         auto shader_test = TestType(std::move(shader_setup));
         shader_test.Run(shader_unit, 1.0f);
 
-        REQUIRE(shader_unit.output[0].x.ToFloat32() == result);
+        REQUIRE(shader_unit.output[shader_unit.output_bank][0].x.ToFloat32() == result);
     }
 }
 

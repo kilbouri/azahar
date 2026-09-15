@@ -31,12 +31,35 @@
 
     <string-array name="portraitLayouts">
         <item>@string/emulation_portrait_layout_top_full</item>
+        <item>@string/emulation_screen_layout_original</item>
         <item>@string/emulation_screen_layout_custom</item>
+    </string-array>
+
+    <string-array name="secondaryLayouts">
+        <item>@string/emulation_secondary_display_opposite</item>
+        <item>@string/emulation_top_screen</item>
+        <item>@string/emulation_bottom_screen</item>
+        <item>@string/emulation_screen_layout_sidebyside</item>
+        <item>@string/emulation_screen_layout_original</item>
+        <item>@string/emulation_screen_layout_hybrid</item>
+        <item>@string/emulation_screen_layout_largescreen</item>
+
     </string-array>
 
     <integer-array name="portraitLayoutValues">
         <item>0</item>
+        <item>2</item>
         <item>1</item>
+    </integer-array>
+
+    <integer-array name="secondaryLayoutValues">
+        <item>4</item>
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+        <item>5</item>
+        <item>6</item>
+        <item>7</item>
     </integer-array>
 
     <string-array name="smallScreenPositions">
@@ -60,6 +83,24 @@
         <item>6</item>
         <item>7</item>
     </integer-array>
+
+    <string-array name="aspectRatioNames">
+        <item>@string/aspect_ratio_default</item>
+        <item>@string/aspect_ratio_16_9</item>
+        <item>@string/aspect_ratio_4_3</item>
+        <item>@string/aspect_ratio_21_9_fullscreen</item>
+        <item>@string/aspect_ratio_16_10_fullscreen_stretched</item>
+        <item>@string/aspect_ratio_stretch</item>
+    </string-array>
+    <integer-array name="aspectRatioValues">
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+        <item>4</item>
+        <item>5</item>
+    </integer-array>
+
 
     <string-array name="regionNames">
         <item>@string/auto_select</item>
@@ -113,6 +154,23 @@
         <item>11</item>
     </integer-array>
 
+    <string-array name="statsPosition">
+        <item>@string/performance_overlay_position_top_left</item>
+        <item>@string/performance_overlay_position_center_top</item>
+        <item>@string/performance_overlay_position_top_right</item>
+        <item>@string/performance_overlay_position_bottom_left</item>
+        <item>@string/performance_overlay_position_center_bottom</item>
+        <item>@string/performance_overlay_position_bottom_right</item>
+    </string-array>
+    <integer-array name="statsPositionValues">
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+        <item>4</item>
+        <item>5</item>
+    </integer-array>
+
     <string-array name="n3dsButtons">
         <item>@string/button_a</item>
         <item>@string/button_b</item>
@@ -129,7 +187,37 @@
         <item>@string/controller_c</item>
         <item>@string/button_home</item>
         <item>@string/button_swap</item>
+        <item>@string/button_turbo</item>
+        <item>@string/button_combo</item>
     </string-array>
+
+    <string-array name="comboOptions">
+        <item>@string/button_a</item>
+        <item>@string/button_b</item>
+        <item>@string/button_x</item>
+        <item>@string/button_y</item>
+        <item>@string/button_l</item>
+        <item>@string/button_r</item>
+        <item>@string/button_zl</item>
+        <item>@string/button_zr</item>
+        <item>@string/button_start</item>
+        <item>@string/button_select</item>
+    </string-array>
+
+    <!-- Ints refer to button values in NativeLibrary -->
+    <integer-array name="comboOptionValues">
+        <item>700</item>
+        <item>701</item>
+        <item>702</item>
+        <item>703</item>
+        <item>773</item>
+        <item>774</item>
+        <item>707</item>
+        <item>708</item>
+        <item>704</item>
+        <item>705</item>
+    </integer-array>
+
 
     <string-array name="cameraImageSourceNames">
         <item>@string/blank</item>
@@ -186,9 +274,8 @@
     </integer-array>
 
     <string-array name="render3dModes">
-        <item>@string/off</item>
         <item>@string/side_by_side</item>
-        <item>@string/reverse_side_by_side</item>
+        <item>@string/side_by_side_full</item>
         <item>@string/anaglyph</item>
         <item>@string/interlaced</item>
         <item>@string/reverse_interlaced</item>
@@ -196,13 +283,26 @@
     </string-array>
 
     <integer-array name="render3dValues">
-        <item>0</item>
         <item>1</item>
         <item>2</item>
         <item>3</item>
         <item>4</item>
         <item>5</item>
         <item>6</item>
+    </integer-array>
+
+    <string-array name="render3dWhichDisplay">
+        <item>@string/off</item>
+        <item>@string/render_3d_which_display_both</item>
+        <item>@string/render_3d_which_display_primary</item>
+        <item>@string/render_3d_which_display_secondary</item>
+    </string-array>
+
+    <integer-array name="render3dDisplayValues">
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
     </integer-array>
 
     <string-array name="graphicsApiNames">
@@ -231,6 +331,17 @@
         <item>3</item>
         <item>4</item>
         <item>5</item>
+    </integer-array>
+
+    <string-array name="textureSamplingNames">
+        <item>@string/game_controlled</item>
+        <item>@string/nearest_neighbor</item>
+        <item>@string/linear</item>
+    </string-array>
+    <integer-array name="textureSamplingValues">
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
     </integer-array>
 
     <string-array name="staticThemeNames">
@@ -298,6 +409,7 @@
     </integer-array>
 
     <string-array name="resolutionFactorNames">
+        <item>@string/internal_resolution_setting_auto</item>
         <item>@string/internal_resolution_setting_1x</item>
         <item>@string/internal_resolution_setting_2x</item>
         <item>@string/internal_resolution_setting_3x</item>
@@ -308,8 +420,17 @@
         <item>@string/internal_resolution_setting_8x</item>
         <item>@string/internal_resolution_setting_9x</item>
         <item>@string/internal_resolution_setting_10x</item>
+        <item>@string/internal_resolution_setting_11x</item>
+        <item>@string/internal_resolution_setting_12x</item>
+        <item>@string/internal_resolution_setting_13x</item>
+        <item>@string/internal_resolution_setting_14x</item>
+        <item>@string/internal_resolution_setting_15x</item>
+        <item>@string/internal_resolution_setting_16x</item>
+        <item>@string/internal_resolution_setting_17x</item>
+        <item>@string/internal_resolution_setting_18x</item>
     </string-array>
     <integer-array name="resolutionFactorValues">
+        <item>0</item>
         <item>1</item>
         <item>2</item>
         <item>3</item>
@@ -320,6 +441,14 @@
         <item>8</item>
         <item>9</item>
         <item>10</item>
+        <item>11</item>
+        <item>12</item>
+        <item>13</item>
+        <item>14</item>
+        <item>15</item>
+        <item>16</item>
+        <item>17</item>
+        <item>18</item>
     </integer-array>
 
     <string-array name="countries">
@@ -567,6 +696,15 @@
         <item>8</item>
         <item>1</item>
         <item>9</item>
+    </integer-array>
+
+    <string-array name="updateCheckChannels">
+        <item>@string/update_check_channel_stable</item>
+        <item>@string/update_check_channel_prerelease</item>
+    </string-array>
+    <integer-array name="updateCheckChannelsValues">
+        <item>0</item>
+        <item>1</item>
     </integer-array>
 
 </resources>

@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2024-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -7,8 +7,10 @@
 #include <memory>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <QFileDialog>
 #include <QFutureWatcher>
+#include <QIcon>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPalette>
@@ -56,10 +58,14 @@
 #include "citra_qt/debugger/graphics/graphics_vertex_shader.h"
 #include "citra_qt/debugger/ipc/recorder.h"
 #include "citra_qt/debugger/lle_service_modules.h"
+#if MICROPROFILE_ENABLED
 #include "citra_qt/debugger/profiler.h"
+#endif
 #include "citra_qt/debugger/registers.h"
 #include "citra_qt/debugger/wait_tree.h"
+#ifdef ENABLE_DISCORD_RPC
 #include "citra_qt/discord.h"
+#endif
 #include "citra_qt/dumping/dumping_dialog.h"
 #include "citra_qt/game_list.h"
 #include "citra_qt/hotkeys.h"
@@ -67,9 +73,10 @@
 #include "citra_qt/movie/movie_play_dialog.h"
 #include "citra_qt/movie/movie_record_dialog.h"
 #include "citra_qt/multiplayer/state.h"
-#include "citra_qt/play_time_manager.h"
 #include "citra_qt/qt_image_interface.h"
+#include "citra_qt/qt_swizzle.h"
 #include "citra_qt/uisettings.h"
+#include "common/play_time_manager.h"
 #ifdef ENABLE_QT_UPDATE_CHECKER
 #include "citra_qt/update_checker.h"
 #endif
@@ -78,7 +85,6 @@
 #include "citra_qt/util/util.h"
 #include "common/arch.h"
 #include "common/common_paths.h"
-#include "common/detached_tasks.h"
 #include "common/dynamic_library/dynamic_library.h"
 #include "common/file_util.h"
 #include "common/literals.h"
@@ -92,6 +98,8 @@
 #endif
 #include "common/settings.h"
 #include "common/string_util.h"
+#include "common/zstd_compression.h"
+#include "core/arm/exception_handler.h"
 #include "core/core.h"
 #include "core/dumping/backend.h"
 #include "core/file_sys/archive_extsavedata.h"
@@ -105,16 +113,17 @@
 #include "core/savestate.h"
 #include "core/system_titles.h"
 #include "input_common/main.h"
-#include "network/network_settings.h"
 #include "ui_main.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 
 #ifdef __APPLE__
 #include "common/apple_authorization.h"
+#include "common/apple_utils.h"
+Q_IMPORT_PLUGIN(QDarwinCameraPermissionPlugin);
 #endif
 
-#ifdef USE_DISCORD_PRESENCE
+#ifdef ENABLE_DISCORD_RPC
 #include "citra_qt/discord_impl.h"
 #endif
 
@@ -135,6 +144,61 @@ constexpr int default_mouse_timeout = 2500;
  */
 
 const int GMainWindow::max_recent_files_item;
+
+// There is a bug in the QT implementation on MSYS2 builds
+// that cause corners to appear when the app is switched to
+// fullscreen. The following code aims to fix that issue
+// until it is addressed upstream. It works by manually
+// disabling corners through the DWM API.
+// TODO(PabloMK7): Remove once the upstream bug is solved.
+#if defined(_WIN32) && !defined(_MSC_VER)
+#define NEEDS_ROUND_CORNERS_FIX
+#endif
+
+#ifdef NEEDS_ROUND_CORNERS_FIX
+#include <dwmapi.h>
+class WindowCornerManager {
+public:
+    static WindowCornerManager& instance() {
+        static WindowCornerManager inst;
+        return inst;
+    }
+
+    void blockRoundedCorners(QWidget* widget, bool block) {
+        HWND hwnd = reinterpret_cast<HWND>(widget->winId());
+        DWORD pref;
+
+        if (block) {
+            pref = DWMWCP_DEFAULT;
+            if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref,
+                                                sizeof(pref)))) {
+                original_prefs[hwnd] = pref;
+            } else {
+                original_prefs[hwnd] = DWMWCP_DEFAULT;
+            }
+
+            pref = DWMWCP_DONOTROUND;
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
+        } else {
+            auto it = original_prefs.find(hwnd);
+            if (it == original_prefs.end())
+                return;
+
+            pref = it->second;
+
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
+
+            original_prefs.erase(it);
+        }
+    }
+
+private:
+    WindowCornerManager() = default;
+    ~WindowCornerManager() = default;
+
+    std::unordered_map<HWND, DWORD> original_prefs;
+};
+#endif
 
 static QString PrettyProductName() {
 #ifdef _WIN32
@@ -167,6 +231,31 @@ void GMainWindow::ShowCommandOutput(std::string title, std::string message) {
     std::cout << message << std::endl;
 #endif
 }
+
+bool IsPrereleaseBuild() {
+    return ((strstr(Common::g_build_fullname, "alpha") != NULL) ||
+            (strstr(Common::g_build_fullname, "beta") != NULL) ||
+            (strstr(Common::g_build_fullname, "rc") != NULL) ||
+            (strstr(Common::g_build_fullname, "test") != NULL));
+}
+
+#ifdef ENABLE_QT_UPDATE_CHECKER
+static bool ShouldCheckForPrereleaseUpdates() {
+    const bool update_channel = UISettings::values.update_check_channel.GetValue();
+    const bool using_prerelease_channel =
+        (update_channel == UISettings::UpdateCheckChannels::PRERELEASE);
+    return (IsPrereleaseBuild() || using_prerelease_channel);
+}
+
+static int GetMajorVersion(const std::string& version) {
+    size_t dot = version.find('.');
+    try {
+        return std::stoi(version.substr(0, dot));
+    } catch (...) {
+        return 0;
+    }
+}
+#endif
 
 GMainWindow::GMainWindow(Core::System& system_)
     : ui{std::make_unique<Ui::MainWindow>()}, system{system_}, movie{system.Movie()},
@@ -211,8 +300,7 @@ GMainWindow::GMainWindow(Core::System& system_)
             if (i >= args.size() - 1 || args[i + 1].startsWith(QChar::fromLatin1('-'))) {
                 continue;
             }
-            Settings::values.use_gdbstub = true;
-            Settings::values.gdbstub_port = strtoul(args[++i].toLatin1(), NULL, 0);
+            gdbport_from_arg = strtoul(args[++i].toLatin1(), NULL, 0);
             continue;
         }
 
@@ -322,9 +410,15 @@ GMainWindow::GMainWindow(Core::System& system_)
     Camera::RegisterFactory("image", std::make_unique<Camera::StillImageCameraFactory>());
     Camera::RegisterFactory("qt", std::make_unique<Camera::QtMultimediaCameraFactory>(qt_cameras));
 
+    system.RegisterInfoLEDColorChanged([this]() { emit InfoLEDColorChanged(); });
+
     LoadTranslation();
 
-    Pica::g_debug_context = Pica::DebugContext::Construct();
+    if (Settings::values.pica_debugging) {
+        Pica::g_debug_context = Pica::DebugContext::Construct();
+    } else {
+        Pica::g_debug_context.reset();
+    }
     setAcceptDrops(true);
     ui->setupUi(this);
     statusBar()->hide();
@@ -332,8 +426,10 @@ GMainWindow::GMainWindow(Core::System& system_)
     default_theme_paths = QIcon::themeSearchPaths();
     UpdateUITheme();
 
+#ifdef ENABLE_DISCORD_RPC
     SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
-    discord_rpc->Update();
+    discord_rpc->Update(false);
+#endif
 
     play_time_manager = std::make_unique<PlayTime::PlayTimeManager>();
 
@@ -364,6 +460,11 @@ GMainWindow::GMainWindow(Core::System& system_)
 
     LOG_INFO(Frontend, "Azahar Version: {} | {}-{}", Common::g_build_fullname, Common::g_scm_branch,
              Common::g_scm_desc);
+    std::string build_variant = Common::g_build_variant;
+    if (build_variant == "") {
+        build_variant = "N/A";
+    }
+    LOG_INFO(Frontend, "Build Variant: {}", build_variant);
 #if CITRA_ARCH(x86_64)
     const auto& caps = Common::GetCPUCaps();
     std::string cpu_string = caps.cpu_string;
@@ -374,7 +475,7 @@ GMainWindow::GMainWindow(Core::System& system_)
         } else if (caps.avx2) {
             cpu_string += '2';
         }
-        if (caps.fma || caps.fma4) {
+        if (caps.fma) {
             cpu_string += " | FMA";
         }
     }
@@ -387,14 +488,37 @@ GMainWindow::GMainWindow(Core::System& system_)
     LOG_INFO(Frontend, "Host Swap: {:.2f} GiB", mem_info.total_swap_memory / f64{1_GiB});
     UpdateWindowTitle();
 
+    QIcon azahar_icon = QIcon(QString::fromStdString(":/icons/default/256x256/azahar.png"));
+    render_window->setWindowIcon(azahar_icon);
+    secondary_window->setWindowIcon(azahar_icon);
+
     show();
+
+#ifdef __APPLE__
+    if (AppleUtils::IsRunningFromTerminal()) {
+        QMessageBox::warning(
+            this, tr("Warning"),
+            tr("The `azahar` executable is being run directly rather than via the Azahar.app "
+               "bundle.\n\n"
+               "When run this way, the app may be missing certain functionality such as camera "
+               "emulation.\n\n"
+               "It is recommended to instead run Azahar using the `open` command, e.g.:\n"
+               "`open ./Azahar.app`"));
+    }
+#endif
 
 #ifdef ENABLE_QT_UPDATE_CHECKER
     if (UISettings::values.check_for_update_on_start) {
         update_future = QtConcurrent::run([]() -> QString {
-            const std::optional<std::string> latest_release = UpdateChecker::CheckForUpdate();
-            if (latest_release && latest_release.value() != Common::g_build_fullname) {
-                return QString::fromStdString(latest_release.value());
+            const std::optional<std::string> latest_release_tag =
+                UpdateChecker::GetLatestRelease(ShouldCheckForPrereleaseUpdates());
+
+            if (latest_release_tag && latest_release_tag.value() != Common::g_build_fullname) {
+                const int latest_major_version = GetMajorVersion(latest_release_tag.value());
+                const int current_major_version = GetMajorVersion(Common::g_build_fullname);
+                if (current_major_version <= latest_major_version) {
+                    return QString::fromStdString(latest_release_tag.value());
+                }
             }
             return QString{};
         });
@@ -404,33 +528,16 @@ GMainWindow::GMainWindow(Core::System& system_)
     }
 #endif
 
-    game_list->LoadCompatibilityList();
-    game_list->PopulateAsync(UISettings::values.game_dirs);
-
     mouse_hide_timer.setInterval(default_mouse_timeout);
     connect(&mouse_hide_timer, &QTimer::timeout, this, &GMainWindow::HideMouseCursor);
     connect(ui->menubar, &QMenuBar::hovered, this, &GMainWindow::OnMouseActivity);
 
 #ifdef ENABLE_OPENGL
     gl_renderer = GetOpenGLRenderer();
-#if defined(_WIN32)
-    if (gl_renderer.startsWith(QStringLiteral("D3D12"))) {
-        // OpenGLOn12 supports but does not yet advertise OpenGL 4.0+
-        // We can override the version here to allow Citra to work.
-        // TODO: Remove this when OpenGL 4.0+ is advertised.
-        qputenv("MESA_GL_VERSION_OVERRIDE", "4.6");
-    }
-#endif
 #endif
 
 #ifdef ENABLE_VULKAN
     physical_devices = GetVulkanPhysicalDevices();
-    if (physical_devices.empty()) {
-        QMessageBox::warning(this, tr("No Suitable Vulkan Devices Detected"),
-                             tr("Vulkan initialization failed during boot.<br/>"
-                                "Your GPU may not support Vulkan 1.1, or you do not "
-                                "have the latest graphics driver."));
-    }
 #endif
 
     if (!game_path.isEmpty()) {
@@ -454,11 +561,6 @@ void GMainWindow::InitializeWidgets() {
     render_window->hide();
     secondary_window->hide();
     secondary_window->setParent(nullptr);
-
-    action_secondary_fullscreen = new QAction(secondary_window);
-    action_secondary_toggle_screen = new QAction(secondary_window);
-    action_secondary_swap_screen = new QAction(secondary_window);
-    action_secondary_rotate_screen = new QAction(secondary_window);
 
     game_list = new GameList(*play_time_manager, this);
     ui->horizontalLayout->addWidget(game_list);
@@ -498,6 +600,8 @@ void GMainWindow::InitializeWidgets() {
     progress_bar->hide();
     statusBar()->addPermanentWidget(progress_bar);
 
+    loading_shaders_label = new QLabel();
+
     artic_traffic_label = new QLabel();
     artic_traffic_label->setToolTip(
         tr("Current Artic traffic speed. Higher values indicate bigger transfer loads."));
@@ -513,8 +617,8 @@ void GMainWindow::InitializeWidgets() {
         tr("Time taken to emulate a 3DS frame, not counting framelimiting or v-sync. For "
            "full-speed emulation this should be at most 16.67 ms."));
 
-    for (auto& label :
-         {artic_traffic_label, emu_speed_label, game_fps_label, emu_frametime_label}) {
+    for (auto& label : {loading_shaders_label, artic_traffic_label, emu_speed_label, game_fps_label,
+                        emu_frametime_label}) {
         label->setVisible(false);
         label->setFrameStyle(QFrame::NoFrame);
         label->setContentsMargins(4, 0, 4, 0);
@@ -566,6 +670,20 @@ void GMainWindow::InitializeWidgets() {
     statusBar()->addPermanentWidget(multiplayer_state->GetStatusText());
     statusBar()->addPermanentWidget(multiplayer_state->GetStatusIcon());
 
+    QFrame* sep = new QFrame(this);
+    sep->setFrameShape(QFrame::VLine);
+    sep->setFrameShadow(QFrame::Sunken);
+    sep->setFixedHeight(16);
+    statusBar()->addPermanentWidget(sep);
+
+    notification_led = new LedWidget();
+    notification_led->setToolTip(tr("Emulated notification LED"));
+    statusBar()->addPermanentWidget(notification_led);
+    connect(this, &GMainWindow::InfoLEDColorChanged, this, [this] {
+        auto led_color = system.GetInfoLEDColor();
+        notification_led->setColor(QColor(led_color.r(), led_color.g(), led_color.b()));
+    });
+
     statusBar()->setVisible(true);
 
     // Removes an ugly inner border from the status bar widgets under Linux
@@ -592,8 +710,12 @@ void GMainWindow::InitializeWidgets() {
 }
 
 void GMainWindow::InitializeDebugWidgets() {
-    connect(ui->action_Create_Pica_Surface_Viewer, &QAction::triggered, this,
-            &GMainWindow::OnCreateGraphicsSurfaceViewer);
+    if (Pica::g_debug_context) {
+        connect(ui->action_Create_Pica_Surface_Viewer, &QAction::triggered, this,
+                &GMainWindow::OnCreateGraphicsSurfaceViewer);
+    } else {
+        ui->action_Create_Pica_Surface_Viewer->setEnabled(false);
+    }
 
     QMenu* debug_menu = ui->menu_View_Debugging;
 
@@ -601,11 +723,6 @@ void GMainWindow::InitializeDebugWidgets() {
     microProfileDialog = new MicroProfileDialog(this);
     microProfileDialog->hide();
     debug_menu->addAction(microProfileDialog->toggleViewAction());
-#else
-    auto micro_profile_stub = new QAction(tr("MicroProfile (unavailable)"), this);
-    micro_profile_stub->setEnabled(false);
-    micro_profile_stub->setChecked(false);
-    debug_menu->addAction(micro_profile_stub);
 #endif
 
     registersWidget = new RegistersWidget(system, this);
@@ -617,35 +734,37 @@ void GMainWindow::InitializeDebugWidgets() {
     connect(this, &GMainWindow::EmulationStopping, registersWidget,
             &RegistersWidget::OnEmulationStopping);
 
-    graphicsWidget = new GPUCommandStreamWidget(system, this);
-    addDockWidget(Qt::RightDockWidgetArea, graphicsWidget);
-    graphicsWidget->hide();
-    debug_menu->addAction(graphicsWidget->toggleViewAction());
+    if (Pica::g_debug_context) {
+        graphicsWidget = new GPUCommandStreamWidget(system, this);
+        addDockWidget(Qt::RightDockWidgetArea, graphicsWidget);
+        graphicsWidget->hide();
+        debug_menu->addAction(graphicsWidget->toggleViewAction());
 
-    graphicsCommandsWidget = new GPUCommandListWidget(system, this);
-    addDockWidget(Qt::RightDockWidgetArea, graphicsCommandsWidget);
-    graphicsCommandsWidget->hide();
-    debug_menu->addAction(graphicsCommandsWidget->toggleViewAction());
+        graphicsCommandsWidget = new GPUCommandListWidget(system, this);
+        addDockWidget(Qt::RightDockWidgetArea, graphicsCommandsWidget);
+        graphicsCommandsWidget->hide();
+        debug_menu->addAction(graphicsCommandsWidget->toggleViewAction());
 
-    graphicsBreakpointsWidget = new GraphicsBreakPointsWidget(Pica::g_debug_context, this);
-    addDockWidget(Qt::RightDockWidgetArea, graphicsBreakpointsWidget);
-    graphicsBreakpointsWidget->hide();
-    debug_menu->addAction(graphicsBreakpointsWidget->toggleViewAction());
+        graphicsBreakpointsWidget = new GraphicsBreakPointsWidget(Pica::g_debug_context, this);
+        addDockWidget(Qt::RightDockWidgetArea, graphicsBreakpointsWidget);
+        graphicsBreakpointsWidget->hide();
+        debug_menu->addAction(graphicsBreakpointsWidget->toggleViewAction());
 
-    graphicsVertexShaderWidget =
-        new GraphicsVertexShaderWidget(system, Pica::g_debug_context, this);
-    addDockWidget(Qt::RightDockWidgetArea, graphicsVertexShaderWidget);
-    graphicsVertexShaderWidget->hide();
-    debug_menu->addAction(graphicsVertexShaderWidget->toggleViewAction());
+        graphicsVertexShaderWidget =
+            new GraphicsVertexShaderWidget(system, Pica::g_debug_context, this);
+        addDockWidget(Qt::RightDockWidgetArea, graphicsVertexShaderWidget);
+        graphicsVertexShaderWidget->hide();
+        debug_menu->addAction(graphicsVertexShaderWidget->toggleViewAction());
 
-    graphicsTracingWidget = new GraphicsTracingWidget(system, Pica::g_debug_context, this);
-    addDockWidget(Qt::RightDockWidgetArea, graphicsTracingWidget);
-    graphicsTracingWidget->hide();
-    debug_menu->addAction(graphicsTracingWidget->toggleViewAction());
-    connect(this, &GMainWindow::EmulationStarting, graphicsTracingWidget,
-            &GraphicsTracingWidget::OnEmulationStarting);
-    connect(this, &GMainWindow::EmulationStopping, graphicsTracingWidget,
-            &GraphicsTracingWidget::OnEmulationStopping);
+        graphicsTracingWidget = new GraphicsTracingWidget(system, Pica::g_debug_context, this);
+        addDockWidget(Qt::RightDockWidgetArea, graphicsTracingWidget);
+        graphicsTracingWidget->hide();
+        debug_menu->addAction(graphicsTracingWidget->toggleViewAction());
+        connect(this, &GMainWindow::EmulationStarting, graphicsTracingWidget,
+                &GraphicsTracingWidget::OnEmulationStarting);
+        connect(this, &GMainWindow::EmulationStopping, graphicsTracingWidget,
+                &GraphicsTracingWidget::OnEmulationStopping);
+    }
 
     waitTreeWidget = new WaitTreeWidget(system, this);
     addDockWidget(Qt::LeftDockWidgetArea, waitTreeWidget);
@@ -696,25 +815,36 @@ void GMainWindow::InitializeRecentFileMenuActions() {
 void GMainWindow::InitializeSaveStateMenuActions() {
     for (u32 i = 0; i < Core::SaveStateSlotCount; ++i) {
         actions_load_state[i] = new QAction(this);
-        actions_load_state[i]->setData(i + 1);
+        actions_load_state[i]->setData(i);
         connect(actions_load_state[i], &QAction::triggered, this, &GMainWindow::OnLoadState);
-        ui->menu_Load_State->addAction(actions_load_state[i]);
-
+        if (i > 0)
+            ui->menu_Load_State->addAction(actions_load_state[i]);
         actions_save_state[i] = new QAction(this);
-        actions_save_state[i]->setData(i + 1);
+        actions_save_state[i]->setData(i);
         connect(actions_save_state[i], &QAction::triggered, this, &GMainWindow::OnSaveState);
-        ui->menu_Save_State->addAction(actions_save_state[i]);
+        if (i > 0)
+            ui->menu_Save_State->addAction(actions_save_state[i]);
     }
 
     connect(ui->action_Load_from_Newest_Slot, &QAction::triggered, this, [this] {
         UpdateSaveStates();
         if (newest_slot != 0) {
-            actions_load_state[newest_slot - 1]->trigger();
+            actions_load_state[newest_slot]->trigger();
         }
     });
     connect(ui->action_Save_to_Oldest_Slot, &QAction::triggered, this, [this] {
         UpdateSaveStates();
-        actions_save_state[oldest_slot - 1]->trigger();
+        actions_save_state[oldest_slot]->trigger();
+    });
+
+    // Quick save / load uses slot
+    connect(ui->action_Quick_Save, &QAction::triggered, this, [this] {
+        UpdateSaveStates();
+        actions_save_state[0]->trigger();
+    });
+    connect(ui->action_Quick_Load, &QAction::triggered, this, [this] {
+        UpdateSaveStates();
+        actions_load_state[0]->trigger();
     });
 
     connect(ui->menu_Load_State->menuAction(), &QAction::hovered, this,
@@ -727,19 +857,30 @@ void GMainWindow::InitializeSaveStateMenuActions() {
 
 void GMainWindow::InitializeHotkeys() {
     hotkey_registry.LoadHotkeys();
-
+    hotkey_registry.buttonMonitor.start(16);
+    LOG_DEBUG(Frontend, "Initializing hotkeys");
     const QString main_window = QStringLiteral("Main Window");
     const QString fullscreen = QStringLiteral("Fullscreen");
 
     // QAction Hotkeys
     const auto link_action_shortcut = [&](QAction* action, const QString& action_name,
-                                          const bool primary_only = false) {
+                                          const bool primary_only = false,
+                                          const bool auto_repeat = false) {
         static const QString main_window = QStringLiteral("Main Window");
-        action->setShortcut(hotkey_registry.GetKeySequence(main_window, action_name));
-        action->setAutoRepeat(false);
+        auto context = hotkey_registry.GetShortcutContext(main_window, action_name);
+        auto shortcut = hotkey_registry.GetKeySequence(main_window, action_name);
+        action->setShortcut(shortcut);
+        action->setShortcutContext(context);
+        action->setAutoRepeat(auto_repeat);
         this->addAction(action);
-        if (!primary_only)
-            secondary_window->addAction(action);
+        // handle the shortcuts that are different per-screen
+        if (context == Qt::WidgetShortcut) {
+            render_window->addAction(action);
+            if (!primary_only) {
+                secondary_window->addAction(action);
+            }
+        }
+        hotkey_registry.SetAction(main_window, action_name, action);
     };
 
     link_action_shortcut(ui->action_Load_File, QStringLiteral("Load File"));
@@ -751,14 +892,23 @@ void GMainWindow::InitializeHotkeys() {
     link_action_shortcut(ui->action_Stop, QStringLiteral("Stop Emulation"));
     link_action_shortcut(ui->action_Show_Filter_Bar, QStringLiteral("Toggle Filter Bar"));
     link_action_shortcut(ui->action_Show_Status_Bar, QStringLiteral("Toggle Status Bar"));
-    link_action_shortcut(ui->action_Fullscreen, fullscreen, true);
+    link_action_shortcut(ui->action_Fullscreen, fullscreen);
     link_action_shortcut(ui->action_Capture_Screenshot, QStringLiteral("Capture Screenshot"));
+    link_action_shortcut(ui->action_Debug_Pause, QStringLiteral("Debug Pause"));
+    link_action_shortcut(ui->action_Debug_Resume, QStringLiteral("Debug Resume"));
+    link_action_shortcut(ui->action_Debug_Step, QStringLiteral("Debug Step"), false, true);
+    link_action_shortcut(ui->action_Debug_Unschedule_All, QStringLiteral("Debug Unschedule All"));
+    link_action_shortcut(ui->action_Debug_Schedule_All, QStringLiteral("Debug Schedule All"));
     link_action_shortcut(ui->action_Screen_Layout_Swap_Screens, QStringLiteral("Swap Screens"));
     link_action_shortcut(ui->action_Screen_Layout_Upright_Screens,
                          QStringLiteral("Rotate Screens Upright"));
     link_action_shortcut(ui->action_Advance_Frame, QStringLiteral("Advance Frame"));
-    link_action_shortcut(ui->action_Load_from_Newest_Slot, QStringLiteral("Load from Newest Slot"));
-    link_action_shortcut(ui->action_Save_to_Oldest_Slot, QStringLiteral("Save to Oldest Slot"));
+    link_action_shortcut(ui->action_Load_from_Newest_Slot,
+                         QStringLiteral("Load from Newest Non-Quicksave Slot"));
+    link_action_shortcut(ui->action_Save_to_Oldest_Slot,
+                         QStringLiteral("Save to Oldest Non-Quicksave Slot"));
+    link_action_shortcut(ui->action_Quick_Save, QStringLiteral("Quick Save"));
+    link_action_shortcut(ui->action_Quick_Load, QStringLiteral("Quick Load"));
     link_action_shortcut(ui->action_View_Lobby, QStringLiteral("Multiplayer Browse Public Rooms"));
     link_action_shortcut(ui->action_Start_Room, QStringLiteral("Multiplayer Create Room"));
     link_action_shortcut(ui->action_Connect_To_Room,
@@ -769,20 +919,27 @@ void GMainWindow::InitializeHotkeys() {
     // QShortcut Hotkeys
     const auto connect_shortcut = [&](const QString& action_name, const auto& function) {
         const auto* hotkey = hotkey_registry.GetHotkey(main_window, action_name, this);
-        const auto* secondary_hotkey =
-            hotkey_registry.GetHotkey(main_window, action_name, secondary_window);
         connect(hotkey, &QShortcut::activated, this, function);
-        connect(secondary_hotkey, &QShortcut::activated, this, function);
     };
 
     connect_shortcut(QStringLiteral("Toggle Screen Layout"), &GMainWindow::ToggleScreenLayout);
     connect_shortcut(QStringLiteral("Exit Fullscreen"), [&] {
         if (emulation_running) {
-            ui->action_Fullscreen->setChecked(false);
-            ToggleFullscreen();
+            if (secondary_window->isActiveWindow()) {
+                secondary_window->showNormal();
+            } else {
+                ui->action_Fullscreen->setChecked(false);
+                ToggleFullscreen();
+            }
         }
     });
+
     connect_shortcut(QStringLiteral("Toggle Per-Application Speed"), [&] {
+        if (!hotkey_registry
+                 .GetKeySequence(QStringLiteral("Main Window"), QStringLiteral("Toggle Turbo Mode"))
+                 .isEmpty()) {
+            return;
+        }
         Settings::values.frame_limit.SetGlobal(!Settings::values.frame_limit.UsingGlobal());
         UpdateStatusBar();
     });
@@ -790,31 +947,12 @@ void GMainWindow::InitializeHotkeys() {
                      [&] { Settings::values.dump_textures = !Settings::values.dump_textures; });
     connect_shortcut(QStringLiteral("Toggle Custom Textures"),
                      [&] { Settings::values.custom_textures = !Settings::values.custom_textures; });
-    // We use "static" here in order to avoid capturing by lambda due to a MSVC bug, which makes
-    // the variable hold a garbage value after this function exits
-    static constexpr u16 SPEED_LIMIT_STEP = 5;
-    connect_shortcut(QStringLiteral("Increase Speed Limit"), [&] {
-        if (Settings::values.frame_limit.GetValue() == 0) {
-            return;
-        }
-        if (Settings::values.frame_limit.GetValue() < 995 - SPEED_LIMIT_STEP) {
-            Settings::values.frame_limit.SetValue(Settings::values.frame_limit.GetValue() +
-                                                  SPEED_LIMIT_STEP);
-        } else {
-            Settings::values.frame_limit = 0;
-        }
-        UpdateStatusBar();
-    });
-    connect_shortcut(QStringLiteral("Decrease Speed Limit"), [&] {
-        if (Settings::values.frame_limit.GetValue() == 0) {
-            Settings::values.frame_limit = 995;
-        } else if (Settings::values.frame_limit.GetValue() > SPEED_LIMIT_STEP) {
-            Settings::values.frame_limit.SetValue(Settings::values.frame_limit.GetValue() -
-                                                  SPEED_LIMIT_STEP);
-            UpdateStatusBar();
-        }
-        UpdateStatusBar();
-    });
+
+    connect_shortcut(QStringLiteral("Toggle Turbo Mode"),
+                     [&] { GMainWindow::SetTurboEnabled(!GMainWindow::IsTurboEnabled()); });
+
+    connect_shortcut(QStringLiteral("Increase Speed Limit"), [&] { AdjustSpeedLimit(true); });
+    connect_shortcut(QStringLiteral("Decrease Speed Limit"), [&] { AdjustSpeedLimit(false); });
 
     connect_shortcut(QStringLiteral("Audio Mute/Unmute"), &GMainWindow::OnMute);
     connect_shortcut(QStringLiteral("Audio Volume Down"), &GMainWindow::OnDecreaseVolume);
@@ -836,7 +974,7 @@ void GMainWindow::InitializeHotkeys() {
     });
     connect_shortcut(QStringLiteral("Increase 3D Factor"), [this] {
         const auto factor_3d = Settings::values.factor_3d.GetValue();
-        if (factor_3d < 100) {
+        if (factor_3d < 255) {
             if (factor_3d % FACTOR_3D_STEP != 0) {
                 Settings::values.factor_3d =
                     factor_3d + FACTOR_3D_STEP - (factor_3d % FACTOR_3D_STEP);
@@ -846,21 +984,6 @@ void GMainWindow::InitializeHotkeys() {
             UpdateStatusBar();
         }
     });
-
-    // Secondary Window QAction Hotkeys
-    const auto add_secondary_window_hotkey = [this](QAction* action, QKeySequence hotkey,
-                                                    const char* slot) {
-        // This action will fire specifically when secondary_window is in focus
-        action->setShortcut(hotkey);
-        disconnect(action, SIGNAL(triggered()), this, slot);
-        connect(action, SIGNAL(triggered()), this, slot);
-        secondary_window->addAction(action);
-    };
-
-    // Use the same fullscreen hotkey as the main window
-    const auto fullscreen_hotkey = hotkey_registry.GetKeySequence(main_window, fullscreen);
-    add_secondary_window_hotkey(action_secondary_fullscreen, fullscreen_hotkey,
-                                SLOT(ToggleSecondaryFullscreen()));
 }
 
 void GMainWindow::SetDefaultUIGeometry() {
@@ -879,6 +1002,7 @@ void GMainWindow::RestoreUIState() {
     restoreGeometry(UISettings::values.geometry);
     restoreState(UISettings::values.state);
     render_window->restoreGeometry(UISettings::values.renderwindow_geometry);
+    secondary_window->restoreGeometry(UISettings::values.secondarywindow_geometry);
 #if MICROPROFILE_ENABLED
     microProfileDialog->restoreGeometry(UISettings::values.microprofile_geometry);
     microProfileDialog->setVisible(UISettings::values.microprofile_visible.GetValue());
@@ -918,7 +1042,7 @@ void GMainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
             OnPauseGame();
         } else if (!emu_thread->IsRunning() && auto_paused && state == Qt::ApplicationActive) {
             auto_paused = false;
-            OnStartGame();
+            OnResumeGame(false);
         }
     }
     if (UISettings::values.mute_when_in_background) {
@@ -963,6 +1087,10 @@ void GMainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::ShowList, this, &GMainWindow::OnGameListShowList);
     connect(game_list, &GameList::PopulatingCompleted, this,
             [this] { multiplayer_state->UpdateGameList(game_list->GetModel()); });
+#ifdef ENABLE_DEVELOPER_OPTIONS
+    connect(game_list, &GameList::StartingLaunchStressTest, this,
+            &GMainWindow::StartLaunchStressTest);
+#endif
 
     connect(game_list, &GameList::OpenPerGameGeneralRequested, this,
             &GMainWindow::OnGameListOpenPerGameProperties);
@@ -981,12 +1109,15 @@ void GMainWindow::ConnectWidgetEvents() {
     connect(this, &GMainWindow::UpdateProgress, this, &GMainWindow::OnUpdateProgress);
     connect(this, &GMainWindow::CIAInstallReport, this, &GMainWindow::OnCIAInstallReport);
     connect(this, &GMainWindow::CIAInstallFinished, this, &GMainWindow::OnCIAInstallFinished);
+    connect(this, &GMainWindow::CompressFinished, this, &GMainWindow::OnCompressFinished);
     connect(this, &GMainWindow::UpdateThemedIcons, multiplayer_state,
             &MultiplayerState::UpdateThemedIcons);
 }
 
 void GMainWindow::ConnectMenuEvents() {
-    const auto connect_menu = [&](QAction* action, const auto& event_fn) {
+    const auto connect_menu = [&](QAction* action, const auto& event_fn,
+                                  QAction::MenuRole role = QAction::NoRole) {
+        action->setMenuRole(role);
         connect(action, &QAction::triggered, this, event_fn);
         // Add actions to this window so that hiding menus in fullscreen won't disable them
         addAction(action);
@@ -1003,9 +1134,12 @@ void GMainWindow::ConnectMenuEvents() {
         connect_menu(ui->menu_Boot_Home_Menu->actions().at(region),
                      [this, region] { OnMenuBootHomeMenu(region); });
     }
-    connect_menu(ui->action_Exit, &QMainWindow::close);
+    connect_menu(ui->action_Exit, &QMainWindow::close, QAction::QuitRole);
     connect_menu(ui->action_Load_Amiibo, &GMainWindow::OnLoadAmiibo);
     connect_menu(ui->action_Remove_Amiibo, &GMainWindow::OnRemoveAmiibo);
+    connect_menu(ui->action_Open_Citra_Folder, &GMainWindow::OnOpenCitraFolder);
+    connect_menu(ui->action_Open_NAND_Folder, &GMainWindow::OnOpenNANDFolder);
+    connect_menu(ui->action_Open_SDMC_Folder, &GMainWindow::OnOpenSDMCFolder);
 
     // Emulation
     connect_menu(ui->action_Pause, &GMainWindow::OnPauseContinueGame);
@@ -1015,7 +1149,7 @@ void GMainWindow::ConnectMenuEvents() {
         QDesktopServices::openUrl(QUrl(QStringLiteral(
             "https://github.com/azahar-emu/compatibility-list/blob/master/CONTRIBUTING.md")));
     });
-    connect_menu(ui->action_Configure, &GMainWindow::OnConfigure);
+    connect_menu(ui->action_Configure, &GMainWindow::OnConfigure, QAction::PreferencesRole);
     connect_menu(ui->action_Configure_Current_Game, &GMainWindow::OnConfigurePerGame);
 
     // View
@@ -1070,8 +1204,32 @@ void GMainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Capture_Screenshot, &GMainWindow::OnCaptureScreenshot);
     connect_menu(ui->action_Dump_Video, &GMainWindow::OnDumpVideo);
 
+    // Tools debug
+    connect_menu(ui->action_Debug_Pause, [this] {
+        if (emu_thread) {
+            emu_thread->SetRunning(false);
+        }
+    });
+    connect_menu(ui->action_Debug_Resume, [this] {
+        if (emu_thread) {
+            emu_thread->SetRunning(true);
+        }
+    });
+    connect_menu(ui->action_Debug_Step, [this] {
+        if (emu_thread) {
+            emu_thread->ExecStep();
+        }
+    });
+    connect_menu(ui->action_Debug_Unschedule_All,
+                 [this] { system.DebugUnscheduleAllThreadsFromFrontend(true); });
+    connect_menu(ui->action_Debug_Schedule_All,
+                 [this] { system.DebugUnscheduleAllThreadsFromFrontend(false); });
+
+    // Tools
+    connect_menu(ui->action_Compress_ROM_File, &GMainWindow::OnCompressFile);
+    connect_menu(ui->action_Decompress_ROM_File, &GMainWindow::OnDecompressFile);
+
     // Help
-    connect_menu(ui->action_Open_Citra_Folder, &GMainWindow::OnOpenCitraFolder);
     connect_menu(ui->action_Open_Log_Folder, []() {
         QString path = QString::fromStdString(FileUtil::GetUserPath(FileUtil::UserPath::LogDir));
         QDesktopServices::openUrl(QUrl::fromLocalFile(path));
@@ -1079,7 +1237,7 @@ void GMainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_FAQ, []() {
         QDesktopServices::openUrl(QUrl(QStringLiteral("https://azahar-emu.org/pages/faq/")));
     });
-    connect_menu(ui->action_About, &GMainWindow::OnMenuAboutCitra);
+    connect_menu(ui->action_About, &GMainWindow::OnMenuAboutCitra, QAction::AboutRole);
 }
 
 void GMainWindow::UpdateMenuState() {
@@ -1105,9 +1263,9 @@ void GMainWindow::UpdateMenuState() {
     ui->action_Advance_Frame->setEnabled(emulation_running && is_paused);
 
     if (emulation_running && is_paused) {
-        ui->action_Pause->setText(tr("&Continue"));
+        ui->action_Pause->setText(tr("Continue"));
     } else {
-        ui->action_Pause->setText(tr("&Pause"));
+        ui->action_Pause->setText(tr("Pause"));
     }
 }
 
@@ -1214,65 +1372,47 @@ bool GMainWindow::LoadROM(const QString& filename) {
 
     const auto scope = render_window->Acquire();
 
+    if (!UISettings::values.inserted_cartridge.GetValue().empty()) {
+        system.InsertCartridge(UISettings::values.inserted_cartridge.GetValue());
+    }
+
     const Core::System::ResultStatus result{
         system.Load(*render_window, filename.toStdString(), secondary_window)};
 
     if (result != Core::System::ResultStatus::Success) {
+        QString invalid_format = tr("Invalid application format");
+        QString invalid_format_description =
+            tr("The application file format not supported.<br>Please make sure you are using one "
+               "of the compatible file formats:<ul><li>Cartridge images: "
+               "<b>.cci/.zcci/.3ds</b></li><li>Installable archives: "
+               "<b>.cia/.zcia</b></li><li>Homebrew titles: <b>.3dsx/.z3dsx</b></li><li>NCCH "
+               "containers: <b>.cxi/.zcxi/.app</b></li><li>ELF files: <b>.elf/.axf</b></li></ul>");
+
         switch (result) {
         case Core::System::ResultStatus::ErrorGetLoader:
-            LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", filename.toStdString());
-            QMessageBox::critical(
-                this, tr("Invalid App Format"),
-                tr("Your app format is not supported.<br/>Please follow the guides to redump your "
-                   "<a "
-                   "href='https://web.archive.org/web/20240304210021/https://citra-emu.org/wiki/"
-                   "dumping-game-cartridges/'>game "
-                   "cartridges</a> or "
-                   "<a "
-                   "href='https://web.archive.org/web/20240304210011/https://citra-emu.org/wiki/"
-                   "dumping-installed-titles/'>installed "
-                   "titles</a>."));
+            LOG_CRITICAL(Frontend, "Failed to obtain loader for {}", filename.toStdString());
+            QMessageBox::critical(this, invalid_format, invalid_format_description);
             break;
 
         case Core::System::ResultStatus::ErrorSystemMode:
-            LOG_CRITICAL(Frontend, "Failed to load App!");
-            QMessageBox::critical(
-                this, tr("App Corrupted"),
-                tr("Your app is corrupted. <br/>Please follow the guides to redump your "
-                   "<a "
-                   "href='https://web.archive.org/web/20240304210021/https://citra-emu.org/wiki/"
-                   "dumping-game-cartridges/'>game "
-                   "cartridges</a> or "
-                   "<a "
-                   "href='https://web.archive.org/web/20240304210011/https://citra-emu.org/wiki/"
-                   "dumping-installed-titles/'>installed "
-                   "titles</a>."));
+            LOG_CRITICAL(Frontend, "Failed to load application!");
+            QMessageBox::critical(this, invalid_format, invalid_format_description);
             break;
 
         case Core::System::ResultStatus::ErrorLoader_ErrorEncrypted: {
-            QMessageBox::critical(this, tr("App Encrypted"),
-                                  tr("Your app is encrypted. <br/>"
+            QMessageBox::critical(this, tr("Encrypted application"),
+                                  tr("Encrypted applications are not supported.<br/>"
                                      "<a "
                                      "href='https://azahar-emu.org/blog/game-loading-changes/'>"
                                      "Please check our blog for more info.</a>"));
             break;
         }
         case Core::System::ResultStatus::ErrorLoader_ErrorInvalidFormat:
-            QMessageBox::critical(
-                this, tr("Invalid App Format"),
-                tr("Your app format is not supported.<br/>Please follow the guides to redump your "
-                   "<a "
-                   "href='https://web.archive.org/web/20240304210021/https://citra-emu.org/wiki/"
-                   "dumping-game-cartridges/'>game "
-                   "cartridges</a> or "
-                   "<a "
-                   "href='https://web.archive.org/web/20240304210011/https://citra-emu.org/wiki/"
-                   "dumping-installed-titles/'>installed "
-                   "titles</a>."));
+            QMessageBox::critical(this, invalid_format, invalid_format_description);
             break;
 
         case Core::System::ResultStatus::ErrorLoader_ErrorGbaTitle:
-            QMessageBox::critical(this, tr("Unsupported App"),
+            QMessageBox::critical(this, tr("Unsupported application"),
                                   tr("GBA Virtual Console is not supported by Azahar."));
             break;
 
@@ -1284,10 +1424,32 @@ bool GMainWindow::LoadROM(const QString& filename) {
                        system.GetStatusDetails())
                        .c_str()));
             break;
+        case Core::System::ResultStatus::ErrorN3DSApplication:
+            QMessageBox::critical(this, tr("Invalid system mode"),
+                                  tr("New 3DS exclusive applications cannot be loaded without "
+                                     "enabling the New 3DS mode."));
+            break;
+        case Core::System::ResultStatus::ErrorLoader:
+            QMessageBox::critical(this, tr("Generic load error"),
+                                  tr("A generic load error occurred while loading the "
+                                     "application.<br/>Please check the log for more details."));
+            break;
+        case Core::System::ResultStatus::ErrorLoader_ErrorPatches:
+            QMessageBox::critical(this, tr("Error applying patches"),
+                                  tr("A generic error occurred while applying a patch to the "
+                                     "application.<br/>Please check the log for more details."));
+            break;
+        case Core::System::ResultStatus::ErrorLoader_ErrorPatchesInvalidTitle:
+            QMessageBox::critical(
+                this, tr("Error applying patches"),
+                tr("Failed to apply a patch because it is designed for a different "
+                   "application.<br/>Please make sure you are using the patches for "
+                   "the right application, region and version."));
+            break;
         default:
             QMessageBox::critical(
-                this, tr("Error while loading App!"),
-                tr("An unknown error occurred. Please see the log for more details."));
+                this, tr("Error while loading application"),
+                tr("An unknown error occurred.<br/>Please see the log for more details."));
             break;
         }
         return false;
@@ -1346,7 +1508,8 @@ void GMainWindow::BootGame(const QString& filename) {
     auto loader = Loader::GetLoader(path);
 
     u64 title_id{0};
-    Loader::ResultStatus res = loader->ReadProgramId(title_id);
+    Loader::ResultStatus res =
+        loader ? loader->ReadProgramId(title_id) : Loader::ResultStatus::Error;
 
     if (Loader::ResultStatus::Success == res) {
         // Load per game settings
@@ -1359,8 +1522,15 @@ void GMainWindow::BootGame(const QString& filename) {
 
     // Artic Server cannot accept a client multiple times, so multiple loaders are not
     // possible. Instead register the app loader early and do not create it again on system load.
-    if (!loader->SupportsMultipleInstancesForSameFile()) {
+    if (loader && !loader->SupportsMultipleInstancesForSameFile()) {
         system.RegisterAppLoaderEarly(loader);
+    }
+
+    // Override GDB settings if emulator was launched with
+    // GDB port option.
+    if (gdbport_from_arg != -1) {
+        system.SetGDBPortOverride(gdbport_from_arg);
+        system.SetDebugNextProcessFlag();
     }
 
     system.ApplySettings();
@@ -1400,7 +1570,7 @@ void GMainWindow::BootGame(const QString& filename) {
     }
 
     // Register debug widgets
-    if (graphicsWidget->isVisible()) {
+    if (graphicsWidget && graphicsWidget->isVisible()) {
         graphicsWidget->Register();
     }
 
@@ -1427,6 +1597,8 @@ void GMainWindow::BootGame(const QString& filename) {
 
     connect(emu_thread.get(), &EmuThread::LoadProgress, loading_screen,
             &LoadingScreen::OnLoadProgress, Qt::QueuedConnection);
+    connect(emu_thread.get(), &EmuThread::SwitchDiskResources, this,
+            &GMainWindow::OnSwitchDiskResources, Qt::QueuedConnection);
     connect(emu_thread.get(), &EmuThread::HideLoadingScreen, loading_screen,
             &LoadingScreen::OnLoadComplete);
 
@@ -1451,7 +1623,7 @@ void GMainWindow::BootGame(const QString& filename) {
         ShowFullscreen();
     }
 
-    OnStartGame();
+    OnResumeGame(true);
 }
 
 void GMainWindow::ShutdownGame() {
@@ -1472,7 +1644,10 @@ void GMainWindow::ShutdownGame() {
 
     AllowOSSleep();
 
+#ifdef ENABLE_DISCORD_RPC
     discord_rpc->Pause();
+#endif
+
     emu_thread->RequestStop();
 
     // Release emu threads from any breakpoints
@@ -1480,10 +1655,12 @@ void GMainWindow::ShutdownGame() {
     // breakpoint after (or before) RequestStop() is called, the emulation would never be able
     // to continue out to the main loop and terminate. Thus wait() would hang forever.
     // TODO(bunnei): This function is not thread safe, but it's being used as if it were
-    Pica::g_debug_context->ClearBreakpoints();
+    if (Pica::g_debug_context) {
+        Pica::g_debug_context->ClearBreakpoints();
+    }
 
     // Unregister debug widgets
-    if (graphicsWidget->isVisible()) {
+    if (graphicsWidget && graphicsWidget->isVisible()) {
         graphicsWidget->Unregister();
     }
 
@@ -1496,10 +1673,13 @@ void GMainWindow::ShutdownGame() {
     emu_thread->wait();
     emu_thread = nullptr;
 
+    system.EjectCartridge();
+
     OnCloseMovie();
 
-    discord_rpc->Update();
-
+#ifdef ENABLE_DISCORD_RPC
+    discord_rpc->Update(false);
+#endif
 #ifdef __unix__
     Common::Linux::StopGamemode();
 #endif
@@ -1526,10 +1706,12 @@ void GMainWindow::ShutdownGame() {
     status_bar_update_timer.stop();
     message_label_used_for_movie = false;
     show_artic_label = false;
+    loading_shaders_label->setVisible(false);
     artic_traffic_label->setVisible(false);
     emu_speed_label->setVisible(false);
     game_fps_label->setVisible(false);
     emu_frametime_label->setVisible(false);
+    notification_led->setColor(QColor(0, 0, 0));
 
     UpdateSaveStates();
 
@@ -1548,6 +1730,18 @@ void GMainWindow::ShutdownGame() {
     render_window->ReleaseRenderTarget();
     secondary_window->ReleaseRenderTarget();
 }
+
+#ifdef ENABLE_DEVELOPER_OPTIONS
+void GMainWindow::StartLaunchStressTest(const QString& game_path) {
+    QThreadPool::globalInstance()->start([this, game_path] {
+        do {
+            ui->action_Stop->trigger();
+            emit game_list->GameChosen(game_path);
+            QThread::sleep(2);
+        } while (emulation_running);
+    });
+}
+#endif
 
 void GMainWindow::StoreRecentFile(const QString& filename) {
     UISettings::values.recent_files.prepend(filename);
@@ -1591,7 +1785,7 @@ void GMainWindow::UpdateSaveStates() {
     ui->menu_Save_State->setEnabled(true);
     ui->action_Load_from_Newest_Slot->setEnabled(false);
 
-    oldest_slot = newest_slot = 0;
+    oldest_slot = newest_slot = 1;
     oldest_slot_time = std::numeric_limits<u64>::max();
     newest_slot_time = 0;
 
@@ -1602,27 +1796,38 @@ void GMainWindow::UpdateSaveStates() {
     auto savestates = Core::ListSaveStates(title_id, movie.GetCurrentMovieID());
     for (u32 i = 0; i < Core::SaveStateSlotCount; ++i) {
         actions_load_state[i]->setEnabled(false);
-        actions_load_state[i]->setText(tr("Slot %1").arg(i + 1));
-        actions_save_state[i]->setText(tr("Slot %1").arg(i + 1));
+        if (i == 0) {
+            actions_load_state[i]->setText(tr("Quick Load"));
+            actions_save_state[i]->setText(tr("Quick Save"));
+        } else {
+            actions_load_state[i]->setText(tr("Slot %1").arg(i));
+            actions_save_state[i]->setText(tr("Slot %1").arg(i));
+        }
     }
     for (const auto& savestate : savestates) {
-        const bool display_name =
-            savestate.status == Core::SaveStateInfo::ValidationStatus::RevisionDismatch &&
-            !savestate.build_name.empty();
-        const auto text =
-            tr("Slot %1 - %2 %3")
-                .arg(savestate.slot)
-                .arg(QDateTime::fromSecsSinceEpoch(savestate.time)
-                         .toString(QStringLiteral("yyyy-MM-dd hh:mm:ss")))
-                .arg(display_name ? QString::fromStdString(savestate.build_name) : QLatin1String())
-                .trimmed();
+        if (savestate.slot >= Core::SaveStateSlotCount) {
+            continue;
+        }
+        actions_load_state[savestate.slot]->setEnabled(true);
+        if (savestate.slot == 0) {
+            const auto text = QStringLiteral("%2")
+                                  .arg(QDateTime::fromSecsSinceEpoch(savestate.time)
+                                           .toString(QStringLiteral("yyyy-MM-dd hh:mm:ss")))
+                                  .trimmed();
+            ui->action_Quick_Save->setText(tr("Quick Save - %1").arg(text).trimmed());
+            ui->action_Quick_Load->setText(tr("Quick Load - %1").arg(text).trimmed());
+            continue;
+        }
+        const auto text = tr("Slot %1 - %2")
+                              .arg(savestate.slot)
+                              .arg(QDateTime::fromSecsSinceEpoch(savestate.time)
+                                       .toString(QStringLiteral("yyyy-MM-dd hh:mm:ss")))
+                              .trimmed();
 
-        actions_load_state[savestate.slot - 1]->setEnabled(true);
-        actions_load_state[savestate.slot - 1]->setText(text);
-        actions_save_state[savestate.slot - 1]->setText(text);
+        actions_load_state[savestate.slot]->setText(text);
+        actions_save_state[savestate.slot]->setText(text);
 
         ui->action_Load_from_Newest_Slot->setEnabled(true);
-
         if (savestate.time > newest_slot_time) {
             newest_slot = savestate.slot;
             newest_slot_time = savestate.time;
@@ -1632,10 +1837,11 @@ void GMainWindow::UpdateSaveStates() {
             oldest_slot_time = savestate.time;
         }
     }
-    for (u32 i = 0; i < Core::SaveStateSlotCount; ++i) {
+    // Value as 1 because quicksave slot is not used for this calculation
+    for (u32 i = 1; i < Core::SaveStateSlotCount; ++i) {
         if (!actions_load_state[i]->isEnabled()) {
             // Prefer empty slot
-            oldest_slot = i + 1;
+            oldest_slot = i;
             oldest_slot_time = 0;
             break;
         }
@@ -1827,7 +2033,9 @@ bool GMainWindow::CreateShortcutLink(const std::filesystem::path& shortcut_path,
         LOG_ERROR(Frontend, "Failed to get IPersistFile interface");
         return false;
     }
-    hres = persist_file->Save(std::filesystem::path{shortcut_path / (name + ".lnk")}.c_str(), TRUE);
+    hres = persist_file->Save(
+        std::filesystem::path{shortcut_path / (Common::UTF8ToUTF16W(name) + L".lnk")}.c_str(),
+        TRUE);
     if (FAILED(hres)) {
         LOG_ERROR(Frontend, "Failed to save shortcut");
         return false;
@@ -2017,7 +2225,7 @@ void GMainWindow::OnGameListDumpRomFS(QString game_path, u64 program_id) {
                 const auto& [base, update] = future_watcher->result();
                 if (base != Loader::ResultStatus::Success) {
                     QMessageBox::critical(
-                        this, tr("Azahar"),
+                        this, QStringLiteral("Azahar"),
                         tr("Could not dump base RomFS.\nRefer to the log for details."));
                     return;
                 }
@@ -2091,9 +2299,8 @@ void GMainWindow::OnGameListOpenPerGameProperties(const QString& file) {
 void GMainWindow::OnMenuLoadFile() {
     const QString extensions = QStringLiteral("*.").append(
         GameList::supported_file_extensions.join(QStringLiteral(" *.")));
-    const QString file_filter = tr("3DS Executable (%1);;All Files (*.*)",
-                                   "%1 is an identifier for the 3DS executable file extensions.")
-                                    .arg(extensions);
+    const QString file_filter = tr("3DS Executable") + QStringLiteral(" (%1)").arg(extensions) +
+                                QStringLiteral(";;") + tr("All Files") + QStringLiteral(" (*.*)");
     const QString filename = QFileDialog::getOpenFileName(
         this, tr("Load File"), UISettings::values.roms_path, file_filter);
 
@@ -2112,15 +2319,18 @@ void GMainWindow::OnMenuSetUpSystemFiles() {
     QVBoxLayout layout(&dialog);
 
     QLabel label_description(
-        tr("<p>Azahar needs files from a real console to be able to use some of its features.<br>"
-           "You can get such files with the <a "
+        tr("<p>Azahar needs console unique data and firmware files from a real console to be "
+           "able to use some of its features.<br>Such files and data can be set up with the <a "
            "href=https://github.com/azahar-emu/ArticSetupTool>Azahar "
-           "Artic Setup Tool</a><br> Notes:<ul><li><b>This operation will install console unique "
-           "files "
-           "to Azahar, do not share your user or nand folders<br>after performing the setup "
-           "process!</b></li><li>Old 3DS setup is needed for the New 3DS setup to "
-           "work.</li><li>Both setup modes will work regardless of the model of the console "
-           "running the setup tool.</li></ul><hr></p>"),
+           "Artic Setup Tool</a><br>Notes:<ul><li><b>This operation will install console unique "
+           "data to Azahar, do not share your user or nand folders<br>after performing the setup "
+           "process!</b></li><li>While doing the setup process, Azahar will link to the console "
+           "running the setup tool. You can unlink the<br>console later from the System tab in the "
+           "emulator configuration menu.</li><li>Do not go online with both Azahar and your 3DS "
+           "console at the same time after setting up system files,<br>as it could cause "
+           "issues.</li><li>Old 3DS setup is needed for the New 3DS setup to work (doing both "
+           "setup modes is recommended).</li><li>Both setup modes will work regardless of the "
+           "model of the console running the setup tool.</li></ul><hr></p>"),
         &dialog);
     label_description.setOpenExternalLinks(true);
     layout.addWidget(&label_description);
@@ -2135,35 +2345,40 @@ void GMainWindow::OnMenuSetUpSystemFiles() {
     QLineEdit textInput(UISettings::values.last_artic_base_addr, &dialog);
     layout_h.addWidget(&textInput);
 
-    QLabel label_select(tr("<br>Choose setup mode:"), &dialog);
+    QLabel label_select(QStringLiteral("<br>") + tr("Choose setup mode:"), &dialog);
     layout.addWidget(&label_select);
 
     std::pair<bool, bool> install_state = Core::AreSystemTitlesInstalled();
 
     QRadioButton radio1(&dialog);
     QRadioButton radio2(&dialog);
+    QString new3dsSetupString = tr("New 3DS setup");
+    QString old3dsSetupString = tr("Old 3DS setup");
+    QString availableIcon = QStringLiteral("(\u2139\uFE0F) ");
+    QString unavailableIcon = QStringLiteral("(\u26A0) ");
+    QString installedIcon = QStringLiteral("(\u2705) ");
     if (!install_state.first) {
         radio1.setChecked(true);
 
-        radio1.setText(tr("(\u2139\uFE0F) Old 3DS setup"));
+        radio1.setText(availableIcon + old3dsSetupString);
         radio1.setToolTip(tr("Setup is possible."));
 
-        radio2.setText(tr("(\u26A0) New 3DS setup"));
+        radio2.setText(unavailableIcon + new3dsSetupString);
         radio2.setToolTip(tr("Old 3DS setup is required first."));
         radio2.setEnabled(false);
     } else {
-        radio1.setText(tr("(\u2705) Old 3DS setup"));
+        radio1.setText(installedIcon + old3dsSetupString);
         radio1.setToolTip(tr("Setup completed."));
 
         if (!install_state.second) {
             radio2.setChecked(true);
 
-            radio2.setText(tr("(\u2139\uFE0F) New 3DS setup"));
+            radio2.setText(availableIcon + new3dsSetupString);
             radio2.setToolTip(tr("Setup is possible."));
         } else {
             radio1.setChecked(true);
 
-            radio2.setText(tr("(\u2705) New 3DS setup"));
+            radio2.setText(installedIcon + new3dsSetupString);
             radio2.setToolTip(tr("Setup completed."));
         }
     }
@@ -2199,7 +2414,8 @@ void GMainWindow::OnMenuSetUpSystemFiles() {
 void GMainWindow::OnMenuInstallCIA() {
     QStringList filepaths = QFileDialog::getOpenFileNames(
         this, tr("Load Files"), UISettings::values.roms_path,
-        tr("3DS Installation File (*.CIA*)") + QStringLiteral(";;") + tr("All Files (*.*)"));
+        tr("3DS Installation File") + QStringLiteral(" (*.cia *.zcia);;") + tr("All Files") +
+            QStringLiteral(" (*.*)"));
 
     if (filepaths.isEmpty()) {
         return;
@@ -2227,8 +2443,8 @@ void GMainWindow::OnMenuBootHomeMenu(u32 region) {
 void GMainWindow::InstallCIA(QStringList filepaths) {
     ui->action_Install_CIA->setEnabled(false);
     game_list->SetDirectoryWatcherEnabled(false);
-    progress_bar->show();
-    progress_bar->setMaximum(INT_MAX);
+
+    emit UpdateProgress(0, 0);
 
     (void)QtConcurrent::run([&, filepaths] {
         Service::AM::InstallStatus status;
@@ -2244,6 +2460,11 @@ void GMainWindow::InstallCIA(QStringList filepaths) {
 }
 
 void GMainWindow::OnUpdateProgress(std::size_t written, std::size_t total) {
+    if (written == 0 and total == 0) {
+        progress_bar->show();
+        progress_bar->setValue(0);
+        progress_bar->setMaximum(INT_MAX);
+    }
     progress_bar->setValue(
         static_cast<int>(INT_MAX * (static_cast<double>(written) / static_cast<double>(total))));
 }
@@ -2278,6 +2499,29 @@ void GMainWindow::OnCIAInstallReport(Service::AM::InstallStatus status, QString 
         QMessageBox::critical(this, tr("Unable to find File"),
                               tr("Could not find %1").arg(filename));
         break;
+    }
+}
+
+void GMainWindow::OnCompressFinished(bool is_compress, bool success) {
+    progress_bar->hide();
+    progress_bar->setValue(0);
+
+    if (!success) {
+        if (is_compress) {
+            QMessageBox::critical(this, tr("Z3DS Compression"),
+                                  tr("Failed to compress some files, check log for details."));
+        } else {
+            QMessageBox::critical(this, tr("Z3DS Compression"),
+                                  tr("Failed to decompress some files, check log for details."));
+        }
+    } else {
+        if (is_compress) {
+            QMessageBox::information(this, tr("Z3DS Compression"),
+                                     tr("All files have been compressed successfully."));
+        } else {
+            QMessageBox::information(this, tr("Z3DS Compression"),
+                                     tr("All files have been decompressed successfully."));
+        }
     }
 }
 
@@ -2333,10 +2577,12 @@ void GMainWindow::UninstallTitles(
     future_watcher.waitForFinished();
 
     if (failed) {
-        QMessageBox::critical(this, tr("Azahar"), tr("Failed to uninstall '%1'.").arg(failed_name));
+        QMessageBox::critical(this, QStringLiteral("Azahar"),
+                              tr("Failed to uninstall '%1'.").arg(failed_name));
     } else if (!future_watcher.isCanceled()) {
-        QMessageBox::information(this, tr("Azahar"),
+        QMessageBox::information(this, QStringLiteral("Azahar"),
                                  tr("Successfully uninstalled '%1'.").arg(first_name));
+        emit InstalledTitlesChanged();
     }
 }
 
@@ -2357,7 +2603,7 @@ void GMainWindow::OnMenuRecentFile() {
     }
 }
 
-void GMainWindow::OnStartGame() {
+void GMainWindow::OnResumeGame(bool first_start) {
     qt_cameras->ResumeCameras();
 
     PreventOSSleep();
@@ -2374,7 +2620,11 @@ void GMainWindow::OnStartGame() {
     play_time_manager->SetProgramId(game_title_id);
     play_time_manager->Start();
 
-    discord_rpc->Update();
+    if (first_start) {
+#ifdef ENABLE_DISCORD_RPC
+        discord_rpc->Update(true);
+#endif
+    }
 
 #ifdef __unix__
     Common::Linux::StartGamemode();
@@ -2411,12 +2661,14 @@ void GMainWindow::OnPauseContinueGame() {
         if (emu_thread->IsRunning() && !system.frame_limiter.IsFrameAdvancing()) {
             OnPauseGame();
         } else {
-            OnStartGame();
+            OnResumeGame(false);
         }
     }
 }
 
 void GMainWindow::OnStopGame() {
+    SetTurboEnabled(false);
+
     play_time_manager->Stop();
     // Update game list to show new play time
     game_list->PopulateAsync(UISettings::values.game_dirs);
@@ -2436,10 +2688,16 @@ void GMainWindow::ToggleFullscreen() {
     if (!emulation_running) {
         return;
     }
-    if (ui->action_Fullscreen->isChecked()) {
-        ShowFullscreen();
+    if (secondary_window->isVisible() && secondary_window->isActiveWindow()) {
+        // undo the action and fullscreen secondary manually
+        ui->action_Fullscreen->toggle();
+        ToggleSecondaryFullscreen();
     } else {
-        HideFullscreen();
+        if (ui->action_Fullscreen->isChecked()) {
+            ShowFullscreen();
+        } else {
+            HideFullscreen();
+        }
     }
 }
 
@@ -2448,8 +2706,17 @@ void GMainWindow::ToggleSecondaryFullscreen() {
         return;
     }
     if (secondary_window->isFullScreen()) {
+#ifdef NEEDS_ROUND_CORNERS_FIX
+        WindowCornerManager::instance().blockRoundedCorners(secondary_window, false);
+#endif
+        secondary_window->restoreGeometry(UISettings::values.secondarywindow_geometry);
         secondary_window->showNormal();
     } else {
+#ifdef NEEDS_ROUND_CORNERS_FIX
+        WindowCornerManager::instance().blockRoundedCorners(secondary_window, true);
+#endif
+        UISettings::values.secondarywindow_geometry = secondary_window->saveGeometry();
+        LOG_INFO(Frontend, "Attempting to fullscreen secondary window");
         secondary_window->showFullScreen();
     }
 }
@@ -2459,9 +2726,15 @@ void GMainWindow::ShowFullscreen() {
         UISettings::values.geometry = saveGeometry();
         ui->menubar->hide();
         statusBar()->hide();
+#ifdef NEEDS_ROUND_CORNERS_FIX
+        WindowCornerManager::instance().blockRoundedCorners(this, true);
+#endif
         showFullScreen();
     } else {
         UISettings::values.renderwindow_geometry = render_window->saveGeometry();
+#ifdef NEEDS_ROUND_CORNERS_FIX
+        WindowCornerManager::instance().blockRoundedCorners(render_window, true);
+#endif
         render_window->showFullScreen();
     }
 }
@@ -2470,9 +2743,15 @@ void GMainWindow::HideFullscreen() {
     if (ui->action_Single_Window_Mode->isChecked()) {
         statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
         ui->menubar->show();
+#ifdef NEEDS_ROUND_CORNERS_FIX
+        WindowCornerManager::instance().blockRoundedCorners(this, false);
+#endif
         showNormal();
         restoreGeometry(UISettings::values.geometry);
     } else {
+#ifdef NEEDS_ROUND_CORNERS_FIX
+        WindowCornerManager::instance().blockRoundedCorners(render_window, false);
+#endif
         render_window->showNormal();
         render_window->restoreGeometry(UISettings::values.renderwindow_geometry);
     }
@@ -2481,7 +2760,7 @@ void GMainWindow::HideFullscreen() {
 void GMainWindow::ToggleWindowMode() {
     if (ui->action_Single_Window_Mode->isChecked()) {
         // Render in the main window...
-        render_window->BackupGeometry();
+        UISettings::values.renderwindow_geometry = render_window->saveGeometry();
         ui->horizontalLayout->addWidget(render_window);
         render_window->setFocusPolicy(Qt::StrongFocus);
         if (emulation_running) {
@@ -2494,10 +2773,9 @@ void GMainWindow::ToggleWindowMode() {
         // Render in a separate window...
         ui->horizontalLayout->removeWidget(render_window);
         render_window->setParent(nullptr);
-        render_window->setFocusPolicy(Qt::NoFocus);
         if (emulation_running) {
             render_window->setVisible(true);
-            render_window->RestoreGeometry();
+            render_window->restoreGeometry(UISettings::values.renderwindow_geometry);
             game_list->show();
         }
     }
@@ -2508,11 +2786,17 @@ void GMainWindow::UpdateSecondaryWindowVisibility() {
         return;
     }
     if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
-        secondary_window->RestoreGeometry();
+        secondary_window->restoreGeometry(UISettings::values.secondarywindow_geometry);
         secondary_window->show();
     } else {
-        secondary_window->BackupGeometry();
+        UISettings::values.secondarywindow_geometry = secondary_window->saveGeometry();
         secondary_window->hide();
+    }
+    // make sure focus is on primary window whenever this changes
+    if (UISettings::values.single_window_mode.GetValue()) {
+        QApplication::setActiveWindow(this);
+    } else {
+        QApplication::setActiveWindow(render_window);
     }
 }
 
@@ -2568,27 +2852,68 @@ void GMainWindow::ChangeSmallScreenPosition() {
     UpdateSecondaryWindowVisibility();
 }
 
+bool GMainWindow::IsTurboEnabled() {
+    return turbo_mode_active;
+}
+
+void GMainWindow::SetTurboEnabled(bool state) {
+    turbo_mode_active = state;
+    GMainWindow::ReloadTurbo();
+}
+
+void GMainWindow::ReloadTurbo() {
+    if (IsTurboEnabled()) {
+        Settings::temporary_frame_limit = Settings::values.turbo_limit.GetValue();
+        Settings::is_temporary_frame_limit = true;
+    } else {
+        Settings::is_temporary_frame_limit = false;
+    }
+
+    UpdateStatusBar();
+}
+
+// TODO: This should probably take in something more descriptive than a bool. -OS
+void GMainWindow::AdjustSpeedLimit(bool increase) {
+    const int SPEED_LIMIT_STEP = 5;
+    auto active_limit =
+        IsTurboEnabled() ? &Settings::values.turbo_limit : &Settings::values.frame_limit;
+    const auto active_limit_value = active_limit->GetValue();
+
+    if (increase) {
+        if (active_limit_value < 995) {
+            active_limit->SetValue(active_limit_value + SPEED_LIMIT_STEP);
+        }
+    } else {
+        if (active_limit_value > SPEED_LIMIT_STEP) {
+            active_limit->SetValue(active_limit_value - SPEED_LIMIT_STEP);
+        }
+    }
+
+    if (IsTurboEnabled()) {
+        ReloadTurbo();
+    }
+
+    UpdateStatusBar();
+}
+
 void GMainWindow::ToggleScreenLayout() {
     const Settings::LayoutOption new_layout = []() {
-        switch (Settings::values.layout_option.GetValue()) {
-        case Settings::LayoutOption::Default:
-            return Settings::LayoutOption::SingleScreen;
-        case Settings::LayoutOption::SingleScreen:
-            return Settings::LayoutOption::LargeScreen;
-        case Settings::LayoutOption::LargeScreen:
-            return Settings::LayoutOption::HybridScreen;
-        case Settings::LayoutOption::HybridScreen:
-            return Settings::LayoutOption::SideScreen;
-        case Settings::LayoutOption::SideScreen:
-            return Settings::LayoutOption::SeparateWindows;
-        case Settings::LayoutOption::SeparateWindows:
-            return Settings::LayoutOption::CustomLayout;
-        case Settings::LayoutOption::CustomLayout:
-            return Settings::LayoutOption::Default;
-        default:
-            LOG_ERROR(Frontend, "Unknown layout option {}",
-                      Settings::values.layout_option.GetValue());
-            return Settings::LayoutOption::Default;
+        const Settings::LayoutOption current_layout = Settings::values.layout_option.GetValue();
+        std::vector<Settings::LayoutOption> layouts_to_cycle =
+            Settings::values.layouts_to_cycle.GetValue();
+        const auto current_pos =
+            distance(layouts_to_cycle.begin(),
+                     std::find(layouts_to_cycle.begin(), layouts_to_cycle.end(), current_layout));
+        // if the layouts_to_cycle setting has somehow been
+        // cleared out, add just default back in
+        if (layouts_to_cycle.size() == 0) {
+            layouts_to_cycle.push_back(Settings::LayoutOption::Default);
+        }
+        if (current_pos >= layouts_to_cycle.size() - 1) {
+            // either this layout wasn't found or it was last so move to the beginning
+            return layouts_to_cycle[0];
+        } else {
+            return layouts_to_cycle[current_pos + 1];
         }
     }();
 
@@ -2617,6 +2942,10 @@ void GMainWindow::TriggerRotateScreens() {
 }
 
 void GMainWindow::OnSaveState() {
+    if (!system.IsPoweredOn()) {
+        return;
+    }
+
     QAction* action = qobject_cast<QAction*>(sender());
     ASSERT(action);
 
@@ -2626,6 +2955,10 @@ void GMainWindow::OnSaveState() {
 }
 
 void GMainWindow::OnLoadState() {
+    if (!system.IsPoweredOn()) {
+        return;
+    }
+
     QAction* action = qobject_cast<QAction*>(sender());
     ASSERT(action);
 
@@ -2653,7 +2986,9 @@ void GMainWindow::OnConfigure() {
     const int old_input_profile_index = Settings::values.current_input_profile_index;
     const auto old_input_profiles = Settings::values.input_profiles;
     const auto old_touch_from_button_maps = Settings::values.touch_from_button_maps;
+#ifdef ENABLE_DISCORD_RPC
     const bool old_discord_presence = UISettings::values.enable_discord_presence.GetValue();
+#endif
 #ifdef __unix__
     const bool old_gamemode = Settings::values.enable_gamemode.GetValue();
 #endif
@@ -2665,9 +3000,12 @@ void GMainWindow::OnConfigure() {
         if (UISettings::values.theme != old_theme) {
             UpdateUITheme();
         }
+#ifdef ENABLE_DISCORD_RPC
         if (UISettings::values.enable_discord_presence.GetValue() != old_discord_presence) {
             SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
+            discord_rpc->Update(system.IsPoweredOn());
         }
+#endif
 #ifdef __unix__
         if (Settings::values.enable_gamemode.GetValue() != old_gamemode) {
             SetGamemodeEnabled(Settings::values.enable_gamemode.GetValue());
@@ -2685,6 +3023,7 @@ void GMainWindow::OnConfigure() {
         } else {
             setMouseTracking(false);
         }
+        ReloadTurbo();
         UpdateSecondaryWindowVisibility();
         UpdateBootHomeMenuState();
         UpdateStatusButtons();
@@ -2720,7 +3059,8 @@ void GMainWindow::OnLoadAmiibo() {
     }
 
     const QString extensions{QStringLiteral("*.bin")};
-    const QString file_filter = tr("Amiibo File (%1);; All Files (*.*)").arg(extensions);
+    const QString file_filter = tr("Amiibo File") + QStringLiteral(" (%1);;").arg(extensions) +
+                                tr("All Files") + QStringLiteral(" (*.*)");
     const QString filename = QFileDialog::getOpenFileName(this, tr("Load Amiibo"), {}, file_filter);
 
     if (filename.isEmpty()) {
@@ -2762,6 +3102,16 @@ void GMainWindow::OnRemoveAmiibo() {
 void GMainWindow::OnOpenCitraFolder() {
     QDesktopServices::openUrl(QUrl::fromLocalFile(
         QString::fromStdString(FileUtil::GetUserPath(FileUtil::UserPath::UserDir))));
+}
+
+void GMainWindow::OnOpenNANDFolder() {
+    QDesktopServices::openUrl(QUrl::fromLocalFile(
+        QString::fromStdString(FileUtil::GetUserPath(FileUtil::UserPath::NANDDir))));
+}
+
+void GMainWindow::OnOpenSDMCFolder() {
+    QDesktopServices::openUrl(QUrl::fromLocalFile(
+        QString::fromStdString(FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir))));
 }
 
 void GMainWindow::OnToggleFilterBar() {
@@ -2832,7 +3182,7 @@ void GMainWindow::OnCloseMovie() {
         }
 
         if (was_running) {
-            OnStartGame();
+            OnResumeGame(false);
         }
     }
 
@@ -2854,7 +3204,7 @@ void GMainWindow::OnSaveMovie() {
     }
 
     if (was_running) {
-        OnStartGame();
+        OnResumeGame(false);
     }
 }
 
@@ -2892,13 +3242,12 @@ void GMainWindow::OnCaptureScreenshot() {
                                           .toString(QStringLiteral("dd.MM.yy_hh.mm.ss.z"))
                                           .toStdString();
         path.append(fmt::format("/{}_{}.png", filename, timestamp));
-
         auto* const screenshot_window =
             secondary_window->HasFocus() ? secondary_window : render_window;
         screenshot_window->CaptureScreenshot(
             UISettings::values.screenshot_resolution_factor.GetValue(),
             QString::fromStdString(path));
-        OnStartGame();
+        OnResumeGame(false);
     }
 }
 
@@ -2908,7 +3257,7 @@ void GMainWindow::ShowFFmpegErrorMessage() {
     message_box.setText(
         tr("FFmpeg could not be loaded. Make sure you have a compatible version installed."
 #ifdef _WIN32
-           "\n\nTo install FFmpeg to Lime, press Open and select your FFmpeg directory."
+           "\n\nTo install FFmpeg to Azahar, press Open and select your FFmpeg directory."
 #endif
            "\n\nTo view a guide on how to install FFmpeg, press Help."));
     message_box.setStandardButtons(QMessageBox::Ok | QMessageBox::Help
@@ -2919,8 +3268,7 @@ void GMainWindow::ShowFFmpegErrorMessage() {
     auto result = message_box.exec();
     if (result == QMessageBox::Help) {
         QDesktopServices::openUrl(
-            QUrl(QStringLiteral("https://web.archive.org/web/20240301121456/https://"
-                                "citra-emu.org/wiki/installing-ffmpeg-for-the-video-dumper/")));
+            QUrl(QStringLiteral("https://github.com/azahar-emu/azahar/wiki/Installing-FFmpeg")));
 #ifdef _WIN32
     } else if (result == QMessageBox::Open) {
         OnOpenFFmpeg();
@@ -2939,6 +3287,197 @@ void GMainWindow::OnDumpVideo() {
         ui->action_Dump_Video->setChecked(false);
         ShowFFmpegErrorMessage();
     }
+}
+
+void GMainWindow::OnCompressFile() {
+    // NOTE: Encrypted files SHOULD NEVER be compressed, otherwise the resulting
+    // compressed file will have very poor compression ratios, due to the high
+    // entropy caused by encryption. This may cause confusion to the user as they
+    // will see the files do not compress well and blame the emulator.
+    //
+    // This is enforced using the loaders as they already return an error on encryption.
+
+    QStringList filepaths = QFileDialog::getOpenFileNames(
+        this, tr("Load 3DS ROM Files"), UISettings::values.roms_path,
+        tr("3DS ROM Files") + QStringLiteral(" (*.cia *.cci *.3dsx *.cxi *.3ds);;") +
+            tr("All Files") + QStringLiteral(" (*.*)"));
+
+    QString out_path;
+
+    if (filepaths.isEmpty()) {
+        return;
+    }
+
+    bool single_file = filepaths.size() == 1;
+    if (single_file) {
+        // If it's a single file, ask the user for the output file.
+        auto compress_info = Loader::GetCompressFileInfo(filepaths[0].toStdString(), true);
+        if (!compress_info.has_value()) {
+            emit CompressFinished(true, false);
+            return;
+        }
+
+        QFileInfo fileinfo(filepaths[0]);
+        QString final_path =
+            fileinfo.path() + QStringLiteral(DIR_SEP) + fileinfo.completeBaseName() +
+            QStringLiteral(".") +
+            QString::fromStdString(compress_info.value().first.recommended_compressed_extension);
+
+        QString out_filter = tr("3DS Compressed ROM File") +
+                             QStringLiteral(" (*.%1)").arg(QString::fromStdString(
+                                 compress_info.value().first.recommended_compressed_extension));
+        out_path = QFileDialog::getSaveFileName(this, tr("Save 3DS Compressed ROM File"),
+                                                final_path, out_filter);
+        if (out_path.isEmpty()) {
+            return;
+        }
+    } else {
+        // Otherwise, ask the user the directory to output the files.
+        out_path = QFileDialog::getExistingDirectory(
+            this, tr("Select Output 3DS Compressed ROM Folder"), UISettings::values.roms_path,
+            QFileDialog::ShowDirsOnly);
+        if (out_path.isEmpty()) {
+            return;
+        }
+    }
+
+    (void)QtConcurrent::run([&, filepaths, out_path] {
+        bool single_file = filepaths.size() == 1;
+        QString out_filepath;
+        bool total_success = true;
+
+        for (const QString& filepath : filepaths) {
+
+            std::string in_path = filepath.toStdString();
+
+            // Identify file type
+            auto compress_info = Loader::GetCompressFileInfo(filepath.toStdString(), true);
+            if (!compress_info.has_value()) {
+                total_success = false;
+                continue;
+            }
+
+            if (single_file) {
+                out_filepath = out_path;
+            } else {
+                QFileInfo fileinfo(filepath);
+                out_filepath = out_path + QStringLiteral(DIR_SEP) + fileinfo.completeBaseName() +
+                               QStringLiteral(".") +
+                               QString::fromStdString(
+                                   compress_info.value().first.recommended_compressed_extension);
+            }
+
+            std::string out_path = out_filepath.toStdString();
+
+            emit UpdateProgress(0, 0);
+
+            const auto progress = [&](std::size_t written, std::size_t total) {
+                emit UpdateProgress(written, total);
+            };
+            bool success = FileUtil::CompressZ3DSFile(in_path, out_path,
+                                                      compress_info.value().first.underlying_magic,
+                                                      compress_info.value().second, progress,
+                                                      compress_info.value().first.default_metadata);
+            if (!success) {
+                total_success = false;
+                FileUtil::Delete(out_path);
+            }
+        }
+
+        emit CompressFinished(true, total_success);
+    });
+}
+
+void GMainWindow::OnDecompressFile() {
+
+    QStringList filepaths = QFileDialog::getOpenFileNames(
+        this, tr("Load 3DS Compressed ROM Files"), UISettings::values.roms_path,
+        tr("3DS Compressed ROM Files") + QStringLiteral(" (*.zcia *zcci *z3dsx *zcxi)") +
+            QStringLiteral(";;") + tr("All Files") + QStringLiteral(" (*.*)"));
+
+    QString out_path;
+
+    if (filepaths.isEmpty()) {
+        return;
+    }
+
+    bool single_file = filepaths.size() == 1;
+    if (single_file) {
+        // If it's a single file, ask the user for the output file.
+        auto compress_info = Loader::GetCompressFileInfo(filepaths[0].toStdString(), false);
+        if (!compress_info.has_value()) {
+            emit CompressFinished(false, false);
+            return;
+        }
+
+        QFileInfo fileinfo(filepaths[0]);
+        QString final_path =
+            fileinfo.path() + QStringLiteral(DIR_SEP) + fileinfo.completeBaseName() +
+            QStringLiteral(".") +
+            QString::fromStdString(compress_info.value().first.recommended_uncompressed_extension);
+
+        QString out_filter = tr("3DS ROM File") +
+                             QStringLiteral(" (*.%1)").arg(QString::fromStdString(
+                                 compress_info.value().first.recommended_uncompressed_extension));
+        out_path =
+            QFileDialog::getSaveFileName(this, tr("Save 3DS ROM File"), final_path, out_filter);
+        if (out_path.isEmpty()) {
+            return;
+        }
+    } else {
+        // Otherwise, ask the user the directory to output the files.
+        out_path = QFileDialog::getExistingDirectory(this, tr("Select Output 3DS ROM Folder"),
+                                                     UISettings::values.roms_path,
+                                                     QFileDialog::ShowDirsOnly);
+        if (out_path.isEmpty()) {
+            return;
+        }
+    }
+
+    (void)QtConcurrent::run([&, filepaths, out_path] {
+        bool single_file = filepaths.size() == 1;
+        QString out_filepath;
+        bool total_success = true;
+
+        for (const QString& filepath : filepaths) {
+
+            std::string in_path = filepath.toStdString();
+
+            // Identify file type
+            auto compress_info = Loader::GetCompressFileInfo(filepath.toStdString(), false);
+            if (!compress_info.has_value()) {
+                total_success = false;
+                continue;
+            }
+
+            if (single_file) {
+                out_filepath = out_path;
+            } else {
+                QFileInfo fileinfo(filepath);
+                out_filepath = out_path + QStringLiteral(DIR_SEP) + fileinfo.completeBaseName() +
+                               QStringLiteral(".") +
+                               QString::fromStdString(
+                                   compress_info.value().first.recommended_uncompressed_extension);
+            }
+
+            std::string out_path = out_filepath.toStdString();
+
+            emit UpdateProgress(0, 0);
+
+            const auto progress = [&](std::size_t written, std::size_t total) {
+                emit UpdateProgress(written, total);
+            };
+
+            // TODO(PabloMK7): What should we do with the metadata?
+            bool success = FileUtil::DeCompressZ3DSFile(in_path, out_path, progress);
+            if (!success) {
+                total_success = false;
+                FileUtil::Delete(out_path);
+            }
+        }
+
+        emit CompressFinished(false, total_success);
+    });
 }
 
 #ifdef _WIN32
@@ -2965,7 +3504,7 @@ void GMainWindow::OnOpenFFmpeg() {
 
     for (auto& library_name : library_names) {
         if (!FileUtil::Exists(bin_dir + DIR_SEP + library_name)) {
-            QMessageBox::critical(this, tr("Azahar"),
+            QMessageBox::critical(this, QStringLiteral("Azahar"),
                                   tr("The provided FFmpeg directory is missing %1. Please make "
                                      "sure the correct directory was selected.")
                                       .arg(QString::fromStdString(library_name)));
@@ -2989,9 +3528,10 @@ void GMainWindow::OnOpenFFmpeg() {
     FileUtil::ForeachDirectoryEntry(nullptr, bin_dir, process_file);
 
     if (success.load()) {
-        QMessageBox::information(this, tr("Azahar"), tr("FFmpeg has been sucessfully installed."));
+        QMessageBox::information(this, QStringLiteral("Azahar"),
+                                 tr("FFmpeg has been sucessfully installed."));
     } else {
-        QMessageBox::critical(this, tr("Azahar"),
+        QMessageBox::critical(this, QStringLiteral("Azahar"),
                               tr("Installation of FFmpeg failed. Check the log file for details."));
     }
 }
@@ -3021,7 +3561,7 @@ void GMainWindow::StartVideoDumping(const QString& path) {
         system.RegisterVideoDumper(dumper);
     } else {
         QMessageBox::critical(
-            this, tr("Azahar"),
+            this, QStringLiteral("Azahar"),
             tr("Could not start video dumping.<br>Please ensure that the video encoder is "
                "configured correctly.<br>Refer to the log for details."));
         ui->action_Dump_Video->setChecked(false);
@@ -3051,7 +3591,7 @@ void GMainWindow::OnStopVideoDumping() {
                 ShutdownGame();
             } else if (game_paused_for_dumping) {
                 game_paused_for_dumping = false;
-                OnStartGame();
+                OnResumeGame(false);
             }
         });
         future_watcher->setFuture(future);
@@ -3106,7 +3646,7 @@ void GMainWindow::UpdateStatusBar() {
                                tr("(Accessing SaveData)")),
             };
 
-        const QString unit = do_mb ? tr("MB/s") : tr("KB/s");
+        const QString unit = do_mb ? QStringLiteral("MB/s") : QStringLiteral("KB/s");
         QString event{};
         for (auto p : perf_events) {
             if (results.artic_events.Get(p.first)) {
@@ -3146,7 +3686,19 @@ void GMainWindow::UpdateStatusBar() {
                                      .arg(Settings::GetFrameLimit()));
     }
     game_fps_label->setText(tr("App: %1 FPS").arg(results.game_fps, 0, 'f', 0));
-    emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
+    if (UISettings::values.show_advanced_frametime_info) {
+        emu_frametime_label->setText(
+            tr("Frame: %1 ms (GPU: [CMD: %2 ms, SWP: %3 ms], IPC: %4 ms, SVC: %5 ms, Rem: %6 ms)")
+                .arg(results.time_vblank_interval * 1000.0, 2, 'f', 2)
+                .arg(results.time_gpu * 1000.0, 2, 'f', 2)
+                .arg(results.time_swap * 1000.0, 2, 'f', 2)
+                .arg(results.time_hle_ipc * 1000.0, 2, 'f', 2)
+                .arg(results.time_hle_svc * 1000.0, 2, 'f', 2)
+                .arg(results.time_remaining * 1000.0, 2, 'f', 2));
+    } else {
+        emu_frametime_label->setText(
+            tr("Frame: %1 ms").arg(results.time_vblank_interval * 1000.0, 2, 'f', 2));
+    }
 
     if (show_artic_label) {
         artic_traffic_label->setVisible(true);
@@ -3265,6 +3817,12 @@ void GMainWindow::UpdateAPIIndicator(bool update) {
         if (api_index == static_cast<u32>(Settings::GraphicsAPI::Vulkan)) {
             api_index = (api_index + 1) % graphics_apis.size();
         }
+#else
+        if (physical_devices.empty()) {
+            if (api_index == static_cast<u32>(Settings::GraphicsAPI::Vulkan)) {
+                api_index = (api_index + 1) % graphics_apis.size();
+            }
+        }
 #endif
         Settings::values.graphics_api = static_cast<Settings::GraphicsAPI>(api_index);
     }
@@ -3297,8 +3855,81 @@ void GMainWindow::mouseReleaseEvent([[maybe_unused]] QMouseEvent* event) {
     OnMouseActivity();
 }
 
+void GMainWindow::showEvent([[maybe_unused]] QShowEvent* event) {
+    game_list->LoadCompatibilityList();
+    game_list->PopulateAsync(UISettings::values.game_dirs);
+}
+
+bool GMainWindow::ShowExceptionDialog(Core::System::ResultStatus result,
+                                      const std::string& details) {
+    QDialog dialog(this);
+    dialog.setWindowTitle(result == Core::System::ResultStatus::ErrorCoreExceptionRaised
+                              ? tr("An exception occurred")
+                              : tr("An invalid memory access occurred"));
+
+    dialog.setMinimumSize(600, 500);
+
+    auto* layout = new QVBoxLayout(&dialog);
+
+    auto* label = new QLabel(
+        result == Core::System::ResultStatus::ErrorCoreExceptionRaised
+            ? tr("An exception occurred while executing the emulated application.")
+            : tr("An invalid memory access occurred while executing the emulated application."));
+
+    layout->addWidget(label);
+
+    auto* textEdit = new QPlainTextEdit();
+    textEdit->setPlainText(QString::fromStdString(details));
+    textEdit->setReadOnly(true);
+    QFont monoFont(QStringLiteral("Monospace"));
+    monoFont.setStyleHint(QFont::TypeWriter);
+    monoFont.setPointSize(10);
+    textEdit->setFont(monoFont);
+    textEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
+    layout->addWidget(textEdit);
+
+    auto* buttonLayout = new QHBoxLayout();
+
+    auto* ignoreButton = new QPushButton(tr("Ignore for this Session"));
+
+    QObject::connect(ignoreButton, &QPushButton::clicked,
+                     []() { Core::SetIgnoreExceptionsForSession(true); });
+
+    buttonLayout->addWidget(ignoreButton);
+    buttonLayout->addStretch();
+
+    auto* continueButton = new QPushButton(tr("Continue"));
+    QObject::connect(continueButton, &QPushButton::clicked, &dialog, &QDialog::reject);
+    buttonLayout->addWidget(continueButton);
+
+    auto* stopButton = new QPushButton(tr("Stop Emulation"));
+    QObject::connect(stopButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+    buttonLayout->addWidget(stopButton);
+
+    layout->addLayout(buttonLayout);
+
+    return dialog.exec() == QDialog::Accepted;
+}
+
 void GMainWindow::OnCoreError(Core::System::ResultStatus result, std::string details) {
     QString status_message;
+
+    // Handle exception dialogs separately
+    if (result == Core::System::ResultStatus::ErrorCoreExceptionRaised) {
+        if (ShowExceptionDialog(result, details)) {
+            if (emu_thread) {
+                ShutdownGame();
+                return;
+            }
+        }
+
+        if (emu_thread) {
+            emu_thread->SetRunning(true);
+            message_label->setText(status_message);
+            message_label_used_for_movie = false;
+        }
+        return;
+    }
 
     QString title, message;
     QMessageBox::Icon error_severity_icon;
@@ -3306,8 +3937,7 @@ void GMainWindow::OnCoreError(Core::System::ResultStatus result, std::string det
     if (result == Core::System::ResultStatus::ErrorSystemFiles) {
         const QString common_message =
             tr("%1 is missing. Please <a "
-               "href='https://citra-emu.org/wiki/"
-               "dumping-system-archives-and-the-shared-fonts-from-a-3ds-console/'>dump your "
+               "href='https://github.com/azahar-emu/azahar/wiki/Dumping-System-Files'>dump your "
                "system archives</a>.<br/>Continuing emulation may result in crashes and bugs.");
 
         if (!details.empty()) {
@@ -3330,13 +3960,22 @@ void GMainWindow::OnCoreError(Core::System::ResultStatus result, std::string det
                    .c_str());
         error_severity_icon = QMessageBox::Icon::Critical;
         can_continue = false;
+    } else if (result == Core::System::ResultStatus::ErrorSavestateBuildMismatch) {
+        title = tr("Savestate version mismatch");
+        message = tr("Could not load savestate because it was created on a different Azahar "
+                     "version:<br/>"
+                     "<b>Azahar %1</b>.<br/><br/>Please read our blog entry <a "
+                     "href='https://azahar-emu.org/blog/understanding-save-states/'>understanding "
+                     "savestates</a> for more information.<br/><br/>To recover your progress, "
+                     "downgrade to <b>Azahar %1</b>, load this savestate and use the application's "
+                     "built-in save functionality.")
+                      .arg(QString::fromStdString(details));
+        error_severity_icon = QMessageBox::Icon::Critical;
     } else {
         title = tr("Fatal Error");
-        message =
-            tr("A fatal error occurred. "
-               "<a href='https://community.citra-emu.org/t/how-to-upload-the-log-file/296'>Check "
-               "the log</a> for details."
-               "<br/>Continuing emulation may result in crashes and bugs.");
+        message = tr("A fatal error occurred. "
+                     "Check the log for details."
+                     "<br/>Continuing emulation may result in crashes and bugs.");
         status_message = tr("Fatal Error encountered");
         error_severity_icon = QMessageBox::Icon::Critical;
     }
@@ -3387,7 +4026,7 @@ bool GMainWindow::ConfirmClose() {
     }
 
     QMessageBox::StandardButton answer =
-        QMessageBox::question(this, tr("Azahar"), tr("Would you like to exit now?"),
+        QMessageBox::question(this, QStringLiteral("Azahar"), tr("Would you like to exit now?"),
                               QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     return answer != QMessageBox::No;
 }
@@ -3407,6 +4046,9 @@ void GMainWindow::closeEvent(QCloseEvent* event) {
         ShutdownGame();
     }
 
+    // Save settings in case they were changed from outside the configuration menu.
+    config->Save();
+
     render_window->close();
     secondary_window->close();
     multiplayer_state->Close();
@@ -3418,8 +4060,8 @@ static bool IsSingleFileDropEvent(const QMimeData* mime) {
     return mime->hasUrls() && mime->urls().length() == 1;
 }
 
-static const std::array<std::string, 8> AcceptedExtensions = {"cci", "cxi", "bin", "3dsx",
-                                                              "app", "elf", "axf"};
+static const std::array<std::string, 11> AcceptedExtensions = {
+    "cci", "cxi", "bin", "3dsx", "app", "elf", "axf", "zcci", "zcxi", "z3dsx", "3ds"};
 
 static bool IsCorrectFileExtension(const QMimeData* mime) {
     const QString& filename = mime->urls().at(0).toLocalFile();
@@ -3480,7 +4122,7 @@ bool GMainWindow::ConfirmChangeGame() {
     }
 
     auto answer = QMessageBox::question(
-        this, tr("Azahar"),
+        this, QStringLiteral("Azahar"),
         tr("The application is still running. Would you like to stop emulation?"),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     return answer != QMessageBox::No;
@@ -3553,31 +4195,68 @@ void GMainWindow::UpdateUITheme() {
 }
 
 void GMainWindow::LoadTranslation() {
+    bool loaded = false;
+
+    const QString lang_en = QStringLiteral("en");
+    const QString languages_dir = QStringLiteral(":/languages/");
+
+    // Workaround for incorrect Qt system language detection
+    // TODO: Allow the "<System>" option to actually be selected rather than overriding the
+    //       selected language option? Current behaviour is better than the issue it fixes,
+    //       but not ideal.
+    if (UISettings::values.language.isEmpty()) {
+        QStringList languages;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
+        languages = QLocale::system().uiLanguages(QLocale::TagSeparator::Underscore);
+#else
+        languages = QLocale::system().uiLanguages();
+        for (auto& lang : languages)
+            lang.replace(u'-', u'_');
+#endif
+        for (const auto& lang : languages) {
+            // If the first language found is English, no need to install any translation
+            if (lang == lang_en) {
+                UISettings::values.language = lang_en;
+                return;
+            }
+            loaded = citraTranslator.load(lang, languages_dir);
+            if (loaded) {
+                UISettings::values.language = lang;
+                break;
+            }
+        }
+    }
+
     // If the selected language is English, no need to install any translation
-    if (UISettings::values.language == QStringLiteral("en")) {
+    if (UISettings::values.language == lang_en) {
         return;
     }
 
-    bool loaded;
-
-    if (UISettings::values.language.isEmpty()) {
+    const QString qtbase_prefix = QStringLiteral("qtbase_");
+    if (UISettings::values.language.isEmpty() && !loaded) {
         // Use the system's default locale
-        loaded = translator.load(QLocale::system(), {}, {}, QStringLiteral(":/languages/"));
+        qtTranslator.load(qtbase_prefix + QLocale::system().name(), {}, {},
+                          QStringLiteral(":/languages/"));
+        loaded = citraTranslator.load(QLocale::system(), {}, {}, QStringLiteral(":/languages/"));
     } else {
         // Otherwise load from the specified file
-        loaded = translator.load(UISettings::values.language, QStringLiteral(":/languages/"));
+        qtTranslator.load(qtbase_prefix + UISettings::values.language,
+                          QStringLiteral(":/languages/"));
+        loaded = citraTranslator.load(UISettings::values.language, QStringLiteral(":/languages/"));
     }
 
     if (loaded) {
-        qApp->installTranslator(&translator);
+        qApp->installTranslator(&qtTranslator);
+        qApp->installTranslator(&citraTranslator);
     } else {
-        UISettings::values.language = QStringLiteral("en");
+        UISettings::values.language = lang_en;
     }
 }
 
 void GMainWindow::OnLanguageChanged(const QString& locale) {
     if (UISettings::values.language != QStringLiteral("en")) {
-        qApp->removeTranslator(&translator);
+        qApp->removeTranslator(&qtTranslator);
+        qApp->removeTranslator(&citraTranslator);
     }
 
     UISettings::values.language = locale;
@@ -3636,12 +4315,29 @@ void GMainWindow::OnEmulatorUpdateAvailable() {
                               .arg(version_string));
     update_prompt.exec();
     if (update_prompt.button(QMessageBox::Yes) == update_prompt.clickedButton()) {
-        QDesktopServices::openUrl(
-            QUrl(QString::fromStdString("https://github.com/azahar-emu/azahar/releases/tag/") +
-                 version_string));
+        std::string update_page_url;
+        if (ShouldCheckForPrereleaseUpdates()) {
+            update_page_url = "https://github.com/azahar-emu/azahar/releases";
+        } else {
+            update_page_url = "https://azahar-emu.org/pages/download/";
+        }
+        QDesktopServices::openUrl(QUrl(QString::fromStdString(update_page_url)));
     }
 }
 #endif
+
+void GMainWindow::OnSwitchDiskResources(VideoCore::LoadCallbackStage stage, std::size_t value,
+                                        std::size_t total, const std::string& object) {
+    if (stage == VideoCore::LoadCallbackStage::Prepare) {
+        loading_shaders_label->setText(QString());
+        loading_shaders_label->setVisible(true);
+    } else if (stage == VideoCore::LoadCallbackStage::Complete) {
+        loading_shaders_label->setVisible(false);
+    } else {
+        loading_shaders_label->setText(
+            loading_screen->GetStageTranslation(stage, value, total, object));
+    }
+}
 
 void GMainWindow::UpdateWindowTitle() {
     const QString full_name = QString::fromUtf8(Common::g_build_fullname);
@@ -3661,6 +4357,9 @@ void GMainWindow::UpdateUISettings() {
     if (!ui->action_Fullscreen->isChecked()) {
         UISettings::values.geometry = saveGeometry();
         UISettings::values.renderwindow_geometry = render_window->saveGeometry();
+    }
+    if (!secondary_window->isFullScreen()) {
+        UISettings::values.secondarywindow_geometry = secondary_window->saveGeometry();
     }
     UISettings::values.state = saveState();
 #if MICROPROFILE_ENABLED
@@ -3735,18 +4434,15 @@ void GMainWindow::RetranslateStatusBar() {
     multiplayer_state->retranslateUi();
 }
 
+#ifdef ENABLE_DISCORD_RPC
 void GMainWindow::SetDiscordEnabled([[maybe_unused]] bool state) {
-#ifdef USE_DISCORD_PRESENCE
     if (state) {
         discord_rpc = std::make_unique<DiscordRPC::DiscordImpl>(system);
     } else {
         discord_rpc = std::make_unique<DiscordRPC::NullImpl>();
     }
-#else
-    discord_rpc = std::make_unique<DiscordRPC::NullImpl>();
-#endif
-    discord_rpc->Update();
 }
+#endif
 
 #ifdef __unix__
 void GMainWindow::SetGamemodeEnabled(bool state) {
@@ -3803,8 +4499,11 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 #endif
 }
 
-void LaunchQtFrontend(int argc, char* argv[]) {
-    Common::DetachedTasks detached_tasks;
+int LaunchQtFrontend(int argc, char* argv[]) {
+#ifdef __APPLE__
+    // Ensure that the linker doesn't optimize qt_swizzle.mm out of existence.
+    QtSwizzle::Dummy();
+#endif
 
 #if MICROPROFILE_ENABLED
     MicroProfileOnThreadCreate("Frontend");
@@ -3813,7 +4512,9 @@ void LaunchQtFrontend(int argc, char* argv[]) {
 
     // Init settings params
     QCoreApplication::setOrganizationName(QStringLiteral("Azahar Developers"));
+    QCoreApplication::setOrganizationDomain(QStringLiteral("azahar_emu.org"));
     QCoreApplication::setApplicationName(QStringLiteral("Azahar"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("org.azahar_emu.Azahar"));
 
     auto rounding_policy = GetHighDpiRoundingPolicy();
     QApplication::setHighDpiScaleFactorRoundingPolicy(rounding_policy);
@@ -3872,7 +4573,9 @@ void LaunchQtFrontend(int argc, char* argv[]) {
     QObject::connect(&app, &QGuiApplication::applicationStateChanged, &main_window,
                      &GMainWindow::OnAppFocusStateChanged);
 
+    // Process any pending events before executing the app (prevents freeze-on–boot on macOS)
+    app.processEvents();
+
     int result = app.exec();
-    detached_tasks.WaitForAllTasks();
-    exit(result);
+    return result;
 }

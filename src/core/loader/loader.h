@@ -1,4 +1,4 @@
-// Copyright Citra Emulator Project / Azahar Emulator Project
+// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -60,7 +60,7 @@ FileType GuessFromExtension(const std::string& extension);
 /**
  * Convert a FileType into a string which can be displayed to the user.
  */
-const char* GetFileTypeString(FileType type);
+const char* GetFileTypeString(FileType type, bool is_compressed = false);
 
 /// Return type for functions in Loader namespace
 enum class ResultStatus {
@@ -76,17 +76,24 @@ enum class ResultStatus {
     ErrorGbaTitle,
     ErrorArtic,
     ErrorNotFound,
+    ErrorPatches,
+    ErrorPatchesInvalidTitle,
 };
-
-constexpr u32 MakeMagic(char a, char b, char c, char d) {
-    return a | b << 8 | c << 16 | d << 24;
-}
 
 /// Interface for loading an application
 class AppLoader : NonCopyable {
 public:
+    struct CompressFileInfo {
+        bool is_supported{};
+        bool is_compressed{};
+        std::array<u8, 4> underlying_magic{};
+        std::string recommended_compressed_extension;
+        std::string recommended_uncompressed_extension;
+        std::unordered_map<std::string, std::vector<u8>> default_metadata;
+    };
+
     explicit AppLoader(Core::System& system_, FileUtil::IOFile&& file)
-        : system(system_), file(std::move(file)) {}
+        : system(system_), file(std::make_unique<FileUtil::IOFile>(std::move(file))) {}
     virtual ~AppLoader() {}
 
     /**
@@ -152,6 +159,10 @@ public:
         return std::make_pair(
             Kernel::New3dsHwCapabilities{false, false, Kernel::New3dsMemoryMode::Legacy},
             ResultStatus::Success);
+    }
+
+    virtual bool IsN3DSExclusive() {
+        return false;
     }
 
     /**
@@ -279,9 +290,23 @@ public:
         return false;
     }
 
+    virtual CompressFileInfo GetCompressFileInfo() {
+        CompressFileInfo info{};
+        info.is_supported = false;
+        return info;
+    }
+
+    virtual bool IsFileCompressed() {
+        return false;
+    }
+
+    virtual std::string GetFilePath() {
+        return file ? file->Filename() : "";
+    }
+
 protected:
     Core::System& system;
-    FileUtil::IOFile file;
+    std::unique_ptr<FileUtil::IOFileBase> file;
     bool is_loaded = false;
     std::optional<Kernel::MemoryMode> memory_mode_override = std::nullopt;
 };
@@ -292,5 +317,8 @@ protected:
  * @return best loader for this file
  */
 std::unique_ptr<AppLoader> GetLoader(const std::string& filename);
+
+std::optional<std::pair<Loader::AppLoader::CompressFileInfo, size_t>> GetCompressFileInfo(
+    const std::string& filepath, bool compress);
 
 } // namespace Loader

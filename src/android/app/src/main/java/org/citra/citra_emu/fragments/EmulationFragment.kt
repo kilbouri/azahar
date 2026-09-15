@@ -1,35 +1,45 @@
-// Copyright 2023 Citra Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
 package org.citra.citra_emu.fragments
 
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.content.Context
 import android.content.DialogInterface
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.net.Uri
+import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.Choreographer
+import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ImageView
 import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.core.content.res.ResourcesCompat
-import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.get
 import androidx.drawerlayout.widget.DrawerLayout
 import androidx.drawerlayout.widget.DrawerLayout.DrawerListener
 import androidx.fragment.app.Fragment
@@ -43,6 +53,7 @@ import androidx.navigation.fragment.navArgs
 import androidx.preference.PreferenceManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.slider.Slider
+import java.io.File
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import org.citra.citra_emu.CitraApplication
@@ -56,30 +67,37 @@ import org.citra.citra_emu.databinding.FragmentEmulationBinding
 import org.citra.citra_emu.display.PortraitScreenLayout
 import org.citra.citra_emu.display.ScreenAdjustmentUtil
 import org.citra.citra_emu.display.ScreenLayout
+import org.citra.citra_emu.display.SecondaryDisplayLayout
+import org.citra.citra_emu.features.hotkeys.Hotkey
+import org.citra.citra_emu.features.settings.model.BooleanSetting
 import org.citra.citra_emu.features.settings.model.IntSetting
 import org.citra.citra_emu.features.settings.model.SettingsViewModel
 import org.citra.citra_emu.features.settings.ui.SettingsActivity
 import org.citra.citra_emu.features.settings.utils.SettingsFile
 import org.citra.citra_emu.model.Game
+import org.citra.citra_emu.utils.BuildUtil
 import org.citra.citra_emu.utils.DirectoryInitialization
 import org.citra.citra_emu.utils.DirectoryInitialization.DirectoryInitializationState
+import org.citra.citra_emu.utils.EmulationLifecycleUtil
 import org.citra.citra_emu.utils.EmulationMenuSettings
-import org.citra.citra_emu.utils.FileUtil
 import org.citra.citra_emu.utils.GameHelper
 import org.citra.citra_emu.utils.GameIconUtils
-import org.citra.citra_emu.utils.EmulationLifecycleUtil
 import org.citra.citra_emu.utils.Log
 import org.citra.citra_emu.utils.ViewUtils
 import org.citra.citra_emu.viewmodel.EmulationViewModel
 
-class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.FrameCallback {
+class EmulationFragment :
+    Fragment(),
+    SurfaceHolder.Callback,
+    Choreographer.FrameCallback {
     private val preferences: SharedPreferences
         get() = PreferenceManager.getDefaultSharedPreferences(CitraApplication.appContext)
 
     private lateinit var emulationState: EmulationState
     private var perfStatsUpdater: Runnable? = null
 
-    private lateinit var emulationActivity: EmulationActivity
+    private val emulationActivity: EmulationActivity
+        get() = (requireActivity() as EmulationActivity)
 
     private var _binding: FragmentEmulationBinding? = null
     private val binding get() = _binding!!
@@ -91,11 +109,17 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
 
     private val emulationViewModel: EmulationViewModel by activityViewModels()
     private val settingsViewModel: SettingsViewModel by viewModels()
+    private val settings get() = settingsViewModel.settings
+
+    private val onPause = Runnable { togglePause() }
+    private val onShutdown = Runnable { emulationState.stop() }
+
+    // Only used if a game is passed through intent on google play variant
+    private var gameFd: Int? = null
 
     override fun onAttach(context: Context) {
         super.onAttach(context)
         if (context is EmulationActivity) {
-            emulationActivity = context
             NativeLibrary.setEmulationActivity(context)
         } else {
             throw IllegalStateException("EmulationFragment must have EmulationActivity parent")
@@ -109,26 +133,52 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         super.onCreate(savedInstanceState)
 
         val intent = requireActivity().intent
-        val intentUri: Uri? = intent.data
+        var intentUri: Uri? = intent.data
         val oldIntentInfo = Pair(
             intent.getStringExtra("SelectedGame"),
             intent.getStringExtra("SelectedTitle")
         )
         var intentGame: Game? = null
-        if (intentUri != null) {
-            intentGame = if (Game.extensions.contains(FileUtil.getExtension(intentUri))) {
-                GameHelper.getGame(intentUri, isInstalled = false, addedToLibrary = false)
-            } else {
-                null
-            }
-        } else if (oldIntentInfo.first != null) {
-            val gameUri = Uri.parse(oldIntentInfo.first)
-            intentGame = if (Game.extensions.contains(FileUtil.getExtension(gameUri))) {
-                GameHelper.getGame(gameUri, isInstalled = false, addedToLibrary = false)
-            } else {
-                null
-            }
+        intentUri = if (intentUri == null && oldIntentInfo.first != null) {
+            Uri.parse(oldIntentInfo.first)
+        } else {
+            intentUri
         }
+        if (intentUri != null) {
+            if (!BuildUtil.isGooglePlayBuild) {
+                val intentUriString = intentUri.toString()
+                // We need to build a special path as the incoming URI may be SAF exclusive
+                Log.warning(
+                    "[EmulationFragment] Cannot determine native path of URI \"" +
+                        intentUriString + "\", using file descriptor instead."
+                )
+                if (!intentUriString.startsWith("!")) {
+                    gameFd =
+                        requireContext().contentResolver.openFileDescriptor(
+                            intentUri,
+                            "r"
+                        )?.detachFd()
+                    intentUri = if (gameFd != null) {
+                        Uri.parse("fd://" + gameFd.toString())
+                    } else {
+                        null
+                    }
+                }
+            }
+            intentGame =
+                intentUri?.let {
+                    // isInstalled, addedToLibrary and mediaType do not matter here
+                    GameHelper.getGame(
+                        it,
+                        isInstalled = false,
+                        addedToLibrary = false,
+                        mediaType = Game.MediaType.GAME_CARD
+                    )
+                }
+        }
+
+        val insertedCartridge = preferences.getString("insertedCartridge", "")
+        NativeLibrary.setInsertedCartridge(insertedCartridge ?: "")
 
         try {
             game = args.game ?: intentGame!!
@@ -142,13 +192,15 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
             return
         }
 
+        Log.info("[EmulationFragment] Starting application " + game.path)
+
         // So this fragment doesn't restart on configuration changes; i.e. rotation.
         retainInstance = true
         emulationState = EmulationState(game.path)
-        emulationActivity = requireActivity() as EmulationActivity
-        screenAdjustmentUtil = ScreenAdjustmentUtil(requireContext(), requireActivity().windowManager, settingsViewModel.settings)
-        EmulationLifecycleUtil.addShutdownHook(hook = { emulationState.stop() })
-        EmulationLifecycleUtil.addPauseResumeHook(hook = { togglePause() })
+        screenAdjustmentUtil =
+            ScreenAdjustmentUtil(requireContext(), requireActivity().windowManager, settings)
+        EmulationLifecycleUtil.addPauseResumeHook(onPause)
+        EmulationLifecycleUtil.addShutdownHook(onShutdown)
     }
 
     override fun onCreateView(
@@ -157,6 +209,14 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         savedInstanceState: Bundle?
     ): View {
         _binding = FragmentEmulationBinding.inflate(inflater)
+        binding.inGameMenu.menu.findItem(R.id.menu_secondary_screen_layout).isVisible =
+            emulationActivity.secondaryDisplayManager.availableDisplays.isNotEmpty()
+        binding.inGameMenu.menu.findItem(R.id.menu_landscape_screen_layout).isVisible =
+            CitraApplication.appContext.resources.configuration.orientation !=
+            Configuration.ORIENTATION_PORTRAIT
+        binding.inGameMenu.menu.findItem(R.id.menu_portrait_screen_layout).isVisible =
+            CitraApplication.appContext.resources.configuration.orientation ==
+            Configuration.ORIENTATION_PORTRAIT
         return binding.root
     }
 
@@ -174,8 +234,11 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
             binding.surfaceInputOverlay.setIsInEditMode(false)
         }
 
-        // Show/hide the "Show FPS" overlay
-        updateShowFpsOverlay()
+        // Show/hide the "Stats" overlay
+        updateShowPerformanceOverlay()
+
+        val position = IntSetting.PERFORMANCE_OVERLAY_POSITION.int
+        updateStatsPosition(position)
 
         binding.drawerLayout.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED)
         binding.drawerLayout.addDrawerListener(object : DrawerListener {
@@ -232,8 +295,15 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
             )
         }
 
-        binding.inGameMenu.getHeaderView(0).findViewById<TextView>(R.id.text_game_title).text =
-            game.title
+        binding.inGameMenu.getHeaderView(0).apply {
+            val titleView = findViewById<TextView>(R.id.text_game_title)
+            val iconView = findViewById<ImageView>(R.id.game_icon)
+
+            titleView.text = game.title
+
+            GameIconUtils.loadGameIcon(requireActivity(), game, iconView)
+        }
+
         binding.inGameMenu.setNavigationItemSelectedListener {
             when (it.itemId) {
                 R.id.menu_emulation_pause -> {
@@ -282,8 +352,18 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                     true
                 }
 
+                R.id.menu_secondary_screen_layout -> {
+                    showSecondaryScreenLayoutMenu()
+                    true
+                }
+
                 R.id.menu_swap_screens -> {
                     screenAdjustmentUtil.swapScreen()
+                    true
+                }
+
+                R.id.menu_rotate_upright -> {
+                    screenAdjustmentUtil.toggleScreenUpright()
                     true
                 }
 
@@ -330,8 +410,13 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                     true
                 }
 
+                R.id.menu_multiplayer -> {
+                    emulationActivity.displayMultiplayerDialog()
+                    true
+                }
+
                 R.id.menu_exit -> {
-                    NativeLibrary.pauseEmulation()
+                    emulationState.pause()
                     MaterialAlertDialogBuilder(requireContext())
                         .setTitle(R.string.emulation_close_game)
                         .setMessage(R.string.emulation_close_game_message)
@@ -339,9 +424,9 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                             EmulationLifecycleUtil.closeGame()
                         }
                         .setNegativeButton(android.R.string.cancel) { _: DialogInterface?, _: Int ->
-                            NativeLibrary.unPauseEmulation()
+                            emulationState.unpause()
                         }
-                        .setOnCancelListener { NativeLibrary.unPauseEmulation() }
+                        .setOnCancelListener { emulationState.unpause() }
                         .show()
                     true
                 }
@@ -420,7 +505,9 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                             ViewUtils.showView(binding.surfaceInputOverlay)
                             binding.inGameMenu.menu.findItem(R.id.menu_emulation_savestates)
                                 .setVisible(NativeLibrary.getSavestateInfo() != null)
-                            binding.drawerLayout.setDrawerLockMode(EmulationMenuSettings.drawerLockMode)
+                            binding.drawerLayout.setDrawerLockMode(
+                                EmulationMenuSettings.drawerLockMode
+                            )
                         }
                     }
                 }
@@ -430,9 +517,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         setInsets()
     }
 
-    fun isDrawerOpen(): Boolean {
-        return binding.drawerLayout.isOpen
-    }
+    fun isDrawerOpen(): Boolean = binding.drawerLayout.isOpen
 
     private fun togglePause() {
         if (emulationState.isPaused) {
@@ -446,7 +531,20 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         super.onResume()
         Choreographer.getInstance().postFrameCallback(this)
         if (NativeLibrary.isRunning()) {
-            NativeLibrary.unPauseEmulation()
+            emulationState.unpause()
+
+            // If the overlay is enabled, we need to update the position if changed
+            val position = IntSetting.PERFORMANCE_OVERLAY_POSITION.int
+            updateStatsPosition(position)
+
+            binding.inGameMenu.menu.findItem(R.id.menu_emulation_pause)?.let { menuItem ->
+                menuItem.title = resources.getString(R.string.pause_emulation)
+                menuItem.icon = ResourcesCompat.getDrawable(
+                    resources,
+                    R.drawable.ic_pause,
+                    requireContext().theme
+                )
+            }
             return
         }
 
@@ -468,6 +566,19 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
     override fun onDetach() {
         NativeLibrary.clearEmulationActivity()
         super.onDetach()
+    }
+
+    override fun onDestroy() {
+        if (::emulationState.isInitialized && requireActivity().isFinishing) {
+            emulationState.stop()
+        }
+        EmulationLifecycleUtil.removeHook(onPause)
+        EmulationLifecycleUtil.removeHook(onShutdown)
+        if (gameFd != null) {
+            ParcelFileDescriptor.adoptFd(gameFd!!).close()
+            gameFd = null
+        }
+        super.onDestroy()
     }
 
     private fun setupCitraDirectoriesThenStartEmulation() {
@@ -520,7 +631,6 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
     }
 
     private fun showStateSubmenu(isSaving: Boolean) {
-
         val savestates = NativeLibrary.getSavestateInfo()
 
         val popupMenu = PopupMenu(
@@ -533,21 +643,27 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                 val slot = i
                 var enableClick = isSaving
                 val text = if (slot == NativeLibrary.QUICKSAVE_SLOT) {
-                    enableClick = false
                     getString(R.string.emulation_quicksave_slot)
                 } else {
                     getString(R.string.emulation_empty_state_slot, slot)
                 }
 
                 add(text).setEnabled(enableClick).setOnMenuItemClickListener {
-                    if(isSaving) {
+                    if (isSaving) {
                         NativeLibrary.saveState(slot)
+                        Toast.makeText(
+                            context,
+                            getString(R.string.saving),
+                            Toast.LENGTH_SHORT
+                        ).show()
                     } else {
                         NativeLibrary.loadState(slot)
                         binding.drawerLayout.close()
-                        Toast.makeText(context,
-                            getString(R.string.quickload_loading),
-                            Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            context,
+                            getString(R.string.loading),
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
                     true
                 }
@@ -555,15 +671,13 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         }
 
         savestates?.forEach {
-            var enableClick = true
-            val text = if(it.slot == NativeLibrary.QUICKSAVE_SLOT) {
-                // do not allow saving in quicksave slot
-                enableClick = !isSaving
-                getString(R.string.emulation_occupied_quicksave_slot, it.time)
-            } else{
-                getString(R.string.emulation_occupied_state_slot, it.slot, it.time)
+            var text: String
+            if (it.slot == NativeLibrary.QUICKSAVE_SLOT) {
+                text = getString(R.string.emulation_occupied_quicksave_slot, it.time)
+            } else {
+                text = getString(R.string.emulation_occupied_state_slot, it.slot, it.time)
             }
-            popupMenu.menu.getItem(it.slot).setTitle(text).setEnabled(enableClick)
+            popupMenu.menu.getItem(it.slot).setTitle(text).setEnabled(true)
         }
 
         popupMenu.show()
@@ -590,7 +704,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
 
         savestates?.forEach {
             val text = getString(R.string.emulation_occupied_state_slot, it.slot, it.time)
-            popupMenu.menu.getItem(it.slot - 1).setTitle(text).setEnabled(true)
+            popupMenu.menu[it.slot - 1].setTitle(text).setEnabled(true)
         }
 
         popupMenu.show()
@@ -624,7 +738,8 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
 
         popupMenu.menu.apply {
             findItem(R.id.menu_show_overlay).isChecked = EmulationMenuSettings.showOverlay
-            findItem(R.id.menu_show_fps).isChecked = EmulationMenuSettings.showFps
+            findItem(R.id.menu_performance_overlay_show).isChecked =
+                BooleanSetting.PERF_OVERLAY_ENABLE.boolean
             findItem(R.id.menu_haptic_feedback).isChecked = EmulationMenuSettings.hapticFeedback
             findItem(R.id.menu_emulation_joystick_rel_center).isChecked =
                 EmulationMenuSettings.joystickRelCenter
@@ -640,15 +755,19 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                     true
                 }
 
-                R.id.menu_show_fps -> {
-                    EmulationMenuSettings.showFps = !EmulationMenuSettings.showFps
-                    updateShowFpsOverlay()
+                R.id.menu_performance_overlay_show -> {
+                    BooleanSetting.PERF_OVERLAY_ENABLE.boolean =
+                        !BooleanSetting.PERF_OVERLAY_ENABLE.boolean
+                    settings.saveSetting(
+                        BooleanSetting.PERF_OVERLAY_ENABLE,
+                        SettingsFile.FILE_NAME_CONFIG
+                    )
+                    updateShowPerformanceOverlay()
                     true
                 }
 
                 R.id.menu_haptic_feedback -> {
                     EmulationMenuSettings.hapticFeedback = !EmulationMenuSettings.hapticFeedback
-                    updateShowFpsOverlay()
                     true
                 }
 
@@ -748,6 +867,16 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                     true
                 }
 
+                R.id.menu_emulation_adjust_scale_button_turbo -> {
+                    showAdjustScaleDialog("controlScale-" + NativeLibrary.ButtonType.BUTTON_TURBO)
+                    true
+                }
+
+                R.id.menu_emulation_adjust_scale_button_combo -> {
+                    showAdjustScaleDialog("controlScale-" + Hotkey.COMBO_BUTTON.button)
+                    true
+                }
+
                 R.id.menu_emulation_adjust_opacity -> {
                     showAdjustOpacityDialog()
                     true
@@ -756,6 +885,11 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                 R.id.menu_emulation_joystick_rel_center -> {
                     EmulationMenuSettings.joystickRelCenter =
                         !EmulationMenuSettings.joystickRelCenter
+                    true
+                }
+
+                R.id.menu_emulation_button_sliding -> {
+                    showButtonSlidingMenu()
                     true
                 }
 
@@ -787,7 +921,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         popupMenu.setOnMenuItemClickListener {
             when (it.itemId) {
                 R.id.menu_emulation_amiibo_load -> {
-                    emulationActivity.openFileLauncher.launch(false)
+                    emulationActivity.openAmiiboFileLauncher.launch(false)
                     true
                 }
 
@@ -801,6 +935,28 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         }
 
         popupMenu.show()
+    }
+
+    private fun showButtonSlidingMenu() {
+        val editor = preferences.edit()
+
+        val buttonSlidingModes = mutableListOf<String>()
+        buttonSlidingModes.add(getString(R.string.emulation_button_sliding_disabled))
+        buttonSlidingModes.add(getString(R.string.emulation_button_sliding_enabled))
+        buttonSlidingModes.add(getString(R.string.emulation_button_sliding_alternative))
+
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.emulation_button_sliding)
+            .setSingleChoiceItems(
+                buttonSlidingModes.toTypedArray(),
+                EmulationMenuSettings.buttonSlide
+            ) { _: DialogInterface?, which: Int ->
+                EmulationMenuSettings.buttonSlide = which
+            }
+            .setPositiveButton(android.R.string.ok) { _: DialogInterface?, _: Int ->
+                editor.apply()
+            }
+            .show()
     }
 
     private fun showLandscapeScreenLayoutMenu() {
@@ -887,12 +1043,14 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
             PortraitScreenLayout.TOP_FULL_WIDTH.int ->
                 R.id.menu_portrait_layout_top_full
 
+            PortraitScreenLayout.ORIGINAL.int ->
+                R.id.menu_portrait_layout_original
+
             PortraitScreenLayout.CUSTOM_PORTRAIT_LAYOUT.int ->
                 R.id.menu_portrait_layout_custom
 
             else ->
                 R.id.menu_portrait_layout_top_full
-
         }
 
         popupMenu.menu.findItem(layoutOptionMenuItem).setChecked(true)
@@ -900,7 +1058,16 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         popupMenu.setOnMenuItemClickListener {
             when (it.itemId) {
                 R.id.menu_portrait_layout_top_full -> {
-                    screenAdjustmentUtil.changePortraitOrientation(PortraitScreenLayout.TOP_FULL_WIDTH.int)
+                    screenAdjustmentUtil.changePortraitOrientation(
+                        PortraitScreenLayout.TOP_FULL_WIDTH.int
+                    )
+                    true
+                }
+
+                R.id.menu_portrait_layout_original -> {
+                    screenAdjustmentUtil.changePortraitOrientation(
+                        PortraitScreenLayout.ORIGINAL.int
+                    )
                     true
                 }
 
@@ -910,7 +1077,9 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                         R.string.emulation_adjust_custom_layout,
                         Toast.LENGTH_LONG
                     ).show()
-                    screenAdjustmentUtil.changePortraitOrientation(PortraitScreenLayout.CUSTOM_PORTRAIT_LAYOUT.int)
+                    screenAdjustmentUtil.changePortraitOrientation(
+                        PortraitScreenLayout.CUSTOM_PORTRAIT_LAYOUT.int
+                    )
                     true
                 }
 
@@ -918,6 +1087,160 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
             }
         }
 
+        popupMenu.show()
+    }
+
+    private fun showSecondaryScreenLayoutMenu() {
+        val popupMenu = PopupMenu(
+            requireContext(),
+            binding.inGameMenu.findViewById(R.id.menu_secondary_screen_layout)
+        )
+        popupMenu.menuInflater.inflate(R.menu.menu_secondary_screen_layout, popupMenu.menu)
+
+        var selectedLayout = IntSetting.SECONDARY_DISPLAY_LAYOUT.int
+        val chooserMenu = popupMenu.menu.findItem(R.id.menu_secondary_choose)
+        val enableSecondaryCheckbox = popupMenu.menu.findItem(R.id.menu_enable_secondary_layout)
+        chooserMenu?.subMenu?.removeGroup(R.id.menu_secondary_management_display_group)
+        val displays =
+            emulationActivity.secondaryDisplayManager.availableDisplays
+
+        if (selectedLayout == SecondaryDisplayLayout.NONE.int ||
+            !BooleanSetting.ENABLE_SECONDARY_DISPLAY.boolean
+        ) {
+            BooleanSetting.ENABLE_SECONDARY_DISPLAY.boolean = false
+            enableSecondaryCheckbox.isChecked = false
+            chooserMenu.isVisible = false
+            popupMenu.menu.setGroupEnabled(R.id.menu_secondary_layout_group, false)
+        } else {
+            popupMenu.menu.setGroupEnabled(R.id.menu_secondary_layout_group, true)
+            chooserMenu.isVisible = (displays.size > 1)
+        }
+        val layoutOptionMenuItem = when (selectedLayout) {
+            SecondaryDisplayLayout.NONE.int ->
+                R.id.menu_secondary_layout_opposite
+
+            SecondaryDisplayLayout.REVERSE_PRIMARY.int ->
+                R.id.menu_secondary_layout_opposite
+
+            SecondaryDisplayLayout.TOP_SCREEN.int ->
+                R.id.menu_secondary_layout_top
+
+            SecondaryDisplayLayout.BOTTOM_SCREEN.int ->
+                R.id.menu_secondary_layout_bottom
+
+            SecondaryDisplayLayout.HYBRID.int ->
+                R.id.menu_secondary_layout_hybrid
+
+            SecondaryDisplayLayout.LARGE_SCREEN.int ->
+                R.id.menu_secondary_layout_largescreen
+
+            SecondaryDisplayLayout.ORIGINAL.int ->
+                R.id.menu_secondary_layout_original
+
+            else ->
+                R.id.menu_secondary_layout_side_by_side
+        }
+        popupMenu.menu.findItem(layoutOptionMenuItem).isChecked = true
+        // Add the available secondary displays to the display chooser list
+        // Use the display ID as the menu ID - since generated menu IDs are all > 1,000,000 this
+        // *should* result in unique ids
+        if (displays.size > 1 && selectedLayout != SecondaryDisplayLayout.NONE.int) {
+            val current = emulationActivity.secondaryDisplayManager.currentDisplayId
+            chooserMenu.isVisible = true
+            displays.forEachIndexed { index, display ->
+                chooserMenu?.subMenu?.add(
+                    R.id.menu_secondary_management_display_group,
+                    display.displayId,
+                    index,
+                    "Display ${display.displayId} - ${display.name}"
+                )?.apply {
+                    isChecked = (display.displayId == current)
+                }
+            }
+            chooserMenu.subMenu?.setGroupCheckable(
+                R.id.menu_secondary_management_display_group,
+                true,
+                true
+            )
+        }
+
+        popupMenu.setOnMenuItemClickListener {
+            when (it.itemId) {
+                R.id.menu_enable_secondary_layout -> {
+                    if (!it.isChecked) {
+                        screenAdjustmentUtil.enableSecondaryDisplay(selectedLayout)
+                    } else {
+                        screenAdjustmentUtil.disableSecondaryDisplay()
+                    }
+                    emulationActivity.secondaryDisplayManager.updateDisplay()
+                    showSecondaryScreenLayoutMenu() // reopen menu to get new behaviors
+                    true
+                }
+
+                R.id.menu_secondary_layout_opposite -> {
+                    screenAdjustmentUtil.changeSecondaryOrientation(
+                        SecondaryDisplayLayout.REVERSE_PRIMARY.int
+                    )
+                    true
+                }
+
+                R.id.menu_secondary_layout_top -> {
+                    screenAdjustmentUtil.changeSecondaryOrientation(
+                        SecondaryDisplayLayout.TOP_SCREEN.int
+                    )
+                    true
+                }
+
+                R.id.menu_secondary_layout_bottom -> {
+                    screenAdjustmentUtil.changeSecondaryOrientation(
+                        SecondaryDisplayLayout.BOTTOM_SCREEN.int
+                    )
+                    true
+                }
+
+                R.id.menu_secondary_layout_side_by_side -> {
+                    screenAdjustmentUtil.changeSecondaryOrientation(
+                        SecondaryDisplayLayout.SIDE_BY_SIDE.int
+                    )
+                    true
+                }
+
+                R.id.menu_secondary_layout_hybrid -> {
+                    screenAdjustmentUtil.changeSecondaryOrientation(
+                        SecondaryDisplayLayout.HYBRID.int
+                    )
+                    true
+                }
+
+                R.id.menu_secondary_layout_original -> {
+                    screenAdjustmentUtil.changeSecondaryOrientation(
+                        SecondaryDisplayLayout.ORIGINAL.int
+                    )
+                    true
+                }
+
+                R.id.menu_secondary_layout_largescreen -> {
+                    screenAdjustmentUtil.changeSecondaryOrientation(
+                        SecondaryDisplayLayout.LARGE_SCREEN.int
+                    )
+                    true
+                }
+
+                R.id.menu_secondary_choose -> {
+                    true
+                }
+
+                else -> {
+                    // display ID selection
+                    // If we are clicking on a menu item that isn't one of the options above, it must
+                    // be one of the dynamically generated menu items added to the secondary display
+                    // choice list.
+                    emulationActivity.secondaryDisplayManager.preferredDisplayId = it.itemId
+                    emulationActivity.secondaryDisplayManager.updateDisplay()
+                    true
+                }
+            }
+        }
         popupMenu.show()
     }
 
@@ -933,20 +1256,22 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
 
     private fun showToggleControlsDialog() {
         val editor = preferences.edit()
-        val enabledButtons = BooleanArray(15)
+        val enabledButtons = BooleanArray(17)
         enabledButtons.forEachIndexed { i: Int, _: Boolean ->
             // Buttons that are disabled by default
             var defaultValue = true
             when (i) {
-                6, 7, 12, 13, 14 -> defaultValue = false
+                // TODO: Remove these magic numbers
+                6, 7, 12, 13, 14, 15, 16 -> defaultValue = false
             }
             enabledButtons[i] = preferences.getBoolean("buttonToggle$i", defaultValue)
         }
 
-        MaterialAlertDialogBuilder(requireContext())
+        val dialog = MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.emulation_toggle_controls)
             .setMultiChoiceItems(
-                R.array.n3dsButtons, enabledButtons
+                R.array.n3dsButtons,
+                enabledButtons
             ) { _: DialogInterface?, indexSelected: Int, isChecked: Boolean ->
                 editor.putBoolean("buttonToggle$indexSelected", isChecked)
             }
@@ -955,38 +1280,63 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                 binding.surfaceInputOverlay.refreshControls()
             }
             .show()
+
+        // Band-aid fix for strange dialog flickering issue
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val displayMetrics = requireActivity().windowManager.currentWindowMetrics
+            val displayHeight = displayMetrics.bounds.height()
+            // The layout visually breaks if we try to set the height directly rather than like this.
+            // Why? Fuck you, that's why!
+            val newAttributes = dialog.window?.attributes
+            newAttributes?.height = (displayHeight * 0.85f).toInt()
+            dialog.window?.attributes = newAttributes
+        }
     }
 
     private fun showAdjustScaleDialog(target: String) {
         val sliderBinding = DialogSliderBinding.inflate(layoutInflater)
 
         sliderBinding.apply {
-            slider.valueTo = 150f
-            slider.valueFrom = 0f
-            slider.value = preferences.getInt(target, 50).toFloat()
-            textValue.setText((slider.value + 50).toInt().toString())
-            textValue.addTextChangedListener( object : TextWatcher {
+            val sliderStart = 50
+            val sliderMin = 0
+            val sliderMax = 150
+            slider.valueFrom = sliderMin.toFloat()
+            slider.valueTo = sliderMax.toFloat()
+            slider.value = preferences.getInt(target, sliderStart)
+                .toFloat()
+                .coerceIn(slider.valueFrom..slider.valueTo)
+            @SuppressLint("SetTextI18n")
+            textValue.setText((slider.value + sliderStart).toInt().toString())
+            textValue.addTextChangedListener(object : TextWatcher {
                 override fun afterTextChanged(s: Editable) {
                     val value = s.toString().toIntOrNull()
-                    if (value == null || value < 50 || value > 150) {
+                    val realValue = value?.minus(sliderStart)
+                    if (realValue == null || realValue < sliderMin || realValue > sliderMax) {
                         textInput.error = "Inappropriate Value"
                     } else {
                         textInput.error = null
-                        slider.value = value.toFloat() - 50
+                        slider.value = realValue.toFloat()
                     }
                 }
+
                 override fun beforeTextChanged(p0: CharSequence?, p1: Int, p2: Int, p3: Int) {}
                 override fun onTextChanged(p0: CharSequence?, p1: Int, p2: Int, p3: Int) {}
             })
             slider.addOnChangeListener(
-                Slider.OnChangeListener { slider: Slider, progress: Float, _: Boolean ->
-                    if (textValue.text.toString() != (slider.value + 50).toInt().toString()) {
-                        textValue.setText((slider.value + 50).toInt().toString())
+                Slider.OnChangeListener {
+                        slider: Slider,
+                        progress: Float,
+                        _: Boolean
+                    ->
+                    if (textValue.text.toString() !=
+                        (slider.value + sliderStart).toInt().toString()
+                    ) {
+                        textValue.setText((slider.value + sliderStart).toInt().toString())
                         textValue.setSelection(textValue.length())
                         setControlScale(slider.value.toInt(), target)
                     }
-
-                })
+                }
+            )
             textInput.suffixText = "%"
         }
         val previousProgress = sliderBinding.slider.value.toInt()
@@ -1015,7 +1365,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
             slider.value = preferences.getInt("controlOpacity", 50).toFloat()
             textValue.setText(slider.value.toInt().toString())
 
-            textValue.addTextChangedListener( object : TextWatcher {
+            textValue.addTextChangedListener(object : TextWatcher {
                 override fun afterTextChanged(s: Editable) {
                     val value = s.toString().toIntOrNull()
                     if (value == null || value < slider.valueFrom || value > slider.valueTo) {
@@ -1025,19 +1375,19 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                         slider.value = value.toFloat()
                     }
                 }
+
                 override fun beforeTextChanged(p0: CharSequence?, p1: Int, p2: Int, p3: Int) {}
                 override fun onTextChanged(p0: CharSequence?, p1: Int, p2: Int, p3: Int) {}
             })
 
-
             slider.addOnChangeListener { _: Slider, value: Float, _: Boolean ->
 
                 if (textValue.text.toString() != slider.value.toInt().toString()) {
-                        textValue.setText(slider.value.toInt().toString())
-                        textValue.setSelection(textValue.length())
-                        setControlOpacity(slider.value.toInt())
-                    }
+                    textValue.setText(slider.value.toInt().toString())
+                    textValue.setSelection(textValue.length())
+                    setControlOpacity(slider.value.toInt())
                 }
+            }
 
             textInput.suffixText = "%"
         }
@@ -1089,6 +1439,8 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         resetScale("controlScale-" + NativeLibrary.ButtonType.STICK_C)
         resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_HOME)
         resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_SWAP)
+        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_TURBO)
+        resetScale("controlScale-" + Hotkey.COMBO_BUTTON.button)
         binding.surfaceInputOverlay.refreshControls()
     }
 
@@ -1116,10 +1468,11 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
             .apply()
 
         val editor = preferences.edit()
-        for (i in 0 until 15) {
+        // TODO: This code sucks balls. We need to do this differently. -OS
+        for (i in 0 until 17) {
             var defaultValue = true
             when (i) {
-                6, 7, 12, 13, 14 -> defaultValue = false
+                6, 7, 12, 13, 14, 15, 16 -> defaultValue = false
             }
             editor.putBoolean("buttonToggle$i", defaultValue)
         }
@@ -1128,33 +1481,152 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         binding.surfaceInputOverlay.resetButtonPlacement()
     }
 
-    fun updateShowFpsOverlay() {
-        if (EmulationMenuSettings.showFps) {
-            val SYSTEM_FPS = 0
-            val FPS = 1
-            val FRAMETIME = 2
-            val SPEED = 3
+    fun updateShowPerformanceOverlay() {
+        if (perfStatsUpdater != null) {
+            perfStatsUpdateHandler.removeCallbacks(perfStatsUpdater!!)
+        }
+
+        if (BooleanSetting.PERF_OVERLAY_ENABLE.boolean) {
+            @Suppress("UnusedVariable")
+            val systemFps = 0
+            val fps = 1
+            val speed = 2
+            val frametime = 3
+            val timeSvc = 4
+            val timeIpc = 5
+            val timeGpu = 6
+            val timeSwap = 7
+            val timeRem = 8
             perfStatsUpdater = Runnable {
+                val sb = StringBuilder()
                 val perfStats = NativeLibrary.getPerfStats()
-                if (perfStats[FPS] > 0) {
-                    binding.showFpsText.text = String.format(
-                        "FPS: %d Speed: %d%% FT: %.2fms",
-                        (perfStats[FPS] + 0.5).toInt(),
-                        (perfStats[SPEED] * 100.0 + 0.5).toInt(),
-                        (perfStats[FRAMETIME] * 1000.0f).toFloat()
-                    )
+                val dividerString = "\u00A0\u2502 "
+                if (perfStats[fps] > 0) {
+                    if (BooleanSetting.PERF_OVERLAY_SHOW_FPS.boolean) {
+                        sb.append(String.format("FPS:\u00A0%d", (perfStats[fps] + 0.5).toInt()))
+                    }
+
+                    if (BooleanSetting.PERF_OVERLAY_SHOW_FRAMETIME.boolean) {
+                        if (sb.isNotEmpty()) sb.append(dividerString)
+                        sb.append(
+                            String.format(
+                                "Frame:\u00A0%.1fms (GPU: [CMD:\u00A0%.1fms SWP:\u00A0%.1fms] IPC:\u00A0%.1fms SVC:\u00A0%.1fms Rem:\u00A0%.1fms)",
+                                (perfStats[frametime] * 1000.0f).toFloat(),
+                                (perfStats[timeGpu] * 1000.0f).toFloat(),
+                                (perfStats[timeSwap] * 1000.0f).toFloat(),
+                                (perfStats[timeIpc] * 1000.0f).toFloat(),
+                                (perfStats[timeSvc] * 1000.0f).toFloat(),
+                                (perfStats[timeRem] * 1000.0f).toFloat()
+                            )
+                        )
+                    }
+
+                    if (BooleanSetting.PERF_OVERLAY_SHOW_SPEED.boolean) {
+                        if (sb.isNotEmpty()) sb.append(dividerString)
+                        sb.append(
+                            String.format(
+                                "Speed:\u00A0%d%%",
+                                (perfStats[speed] * 100.0 + 0.5).toInt()
+                            )
+                        )
+                    }
+
+                    if (BooleanSetting.PERF_OVERLAY_SHOW_APP_RAM_USAGE.boolean) {
+                        if (sb.isNotEmpty()) sb.append(dividerString)
+                        val appRamUsage =
+                            File("/proc/self/statm").readLines()[0].split(' ')[1].toLong() * 4096 /
+                                1000000
+                        sb.append("Process\u00A0RAM:\u00A0$appRamUsage\u00A0MB")
+                    }
+
+                    if (BooleanSetting.PERF_OVERLAY_SHOW_AVAILABLE_RAM.boolean) {
+                        if (sb.isNotEmpty()) sb.append(dividerString)
+                        context?.let { ctx ->
+                            val activityManager =
+                                ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                            val memInfo = ActivityManager.MemoryInfo()
+                            activityManager.getMemoryInfo(memInfo)
+                            val megabyteBytes = 1048576L
+                            val availableRam = memInfo.availMem / megabyteBytes
+                            sb.append("Available\u00A0RAM:\u00A0$availableRam\u00A0MB")
+                        }
+                    }
+
+                    if (BooleanSetting.PERF_OVERLAY_SHOW_BATTERY_TEMP.boolean) {
+                        if (sb.isNotEmpty()) sb.append(dividerString)
+                        val batteryTemp = getBatteryTemperature()
+                        val tempF = celsiusToFahrenheit(batteryTemp)
+                        sb.append(String.format("%.1f°C/%.1f°F", batteryTemp, tempF))
+                    }
+
+                    if (BooleanSetting.PERF_OVERLAY_BACKGROUND.boolean) {
+                        binding.performanceOverlayShowText.setBackgroundResource(
+                            R.color.citra_transparent_black
+                        )
+                    } else {
+                        binding.performanceOverlayShowText.setBackgroundResource(0)
+                    }
+
+                    binding.performanceOverlayShowText.text = sb.toString()
                 }
-                perfStatsUpdateHandler.postDelayed(perfStatsUpdater!!, 3000)
+                perfStatsUpdateHandler.postDelayed(perfStatsUpdater!!, 1000)
             }
             perfStatsUpdateHandler.post(perfStatsUpdater!!)
-            binding.showFpsText.visibility = View.VISIBLE
+            binding.performanceOverlayShowText.visibility = View.VISIBLE
         } else {
-            if (perfStatsUpdater != null) {
-                perfStatsUpdateHandler.removeCallbacks(perfStatsUpdater!!)
-            }
-            binding.showFpsText.visibility = View.GONE
+            binding.performanceOverlayShowText.visibility = View.GONE
         }
     }
+
+    private fun updateStatsPosition(position: Int) {
+        val params =
+            binding.performanceOverlayShowText.layoutParams as CoordinatorLayout.LayoutParams
+        val padding = (20 * resources.displayMetrics.density).toInt() // 20dp
+        params.setMargins(padding, 0, padding, 0)
+
+        when (position) {
+            0 -> {
+                params.gravity = (Gravity.TOP or Gravity.START)
+            }
+
+            1 -> {
+                params.gravity = (Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            }
+
+            2 -> {
+                params.gravity = (Gravity.TOP or Gravity.END)
+            }
+
+            3 -> {
+                params.gravity = (Gravity.BOTTOM or Gravity.START)
+            }
+
+            4 -> {
+                params.gravity = (Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+            }
+
+            5 -> {
+                params.gravity = (Gravity.BOTTOM or Gravity.END)
+            }
+        }
+
+        binding.performanceOverlayShowText.layoutParams = params
+    }
+
+    private fun getBatteryTemperature(): Float {
+        try {
+            val batteryIntent =
+                requireContext().registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            // Temperature in tenths of a degree Celsius
+            val temperature = batteryIntent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+            // Convert to degrees Celsius
+            return temperature / 10.0f
+        } catch (e: Exception) {
+            return 0.0f
+        }
+    }
+
+    private fun celsiusToFahrenheit(celsius: Float): Float = (celsius * 9 / 5) + 32
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         // We purposely don't do anything here.
@@ -1175,40 +1647,31 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
         NativeLibrary.doFrame()
     }
 
-    private fun setInsets() {
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.inGameMenu
-        ) { v: View, windowInsets: WindowInsetsCompat ->
-            val cutInsets: Insets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-            var left = 0
-            var right = 0
-            if (ViewCompat.getLayoutDirection(v) == ViewCompat.LAYOUT_DIRECTION_LTR) {
-                left = cutInsets.left
-            } else {
-                right = cutInsets.right
-            }
-
-            v.setPadding(left, cutInsets.top, right, 0)
-
-            // Ensure FPS text doesn't get cut off by rounded display corners
-            val sidePadding = resources.getDimensionPixelSize(R.dimen.spacing_large)
-            if (cutInsets.left == 0) {
-                binding.showFpsText.setPadding(
-                    sidePadding,
-                    cutInsets.top,
-                    cutInsets.right,
-                    cutInsets.bottom
-                )
-            } else {
-                binding.showFpsText.setPadding(
-                    cutInsets.left,
-                    cutInsets.top,
-                    cutInsets.right,
-                    cutInsets.bottom
-                )
-            }
+    private val applyCutoutInsets: (View, WindowInsetsCompat) -> WindowInsetsCompat = {
+            v,
             windowInsets
+        ->
+        val cutout = windowInsets.displayCutout
+        val mlp = v.layoutParams as ViewGroup.MarginLayoutParams?
+        mlp?.setMargins(
+            cutout?.safeInsetLeft ?: 0,
+            cutout?.safeInsetTop ?: 0,
+            cutout?.safeInsetRight ?: 0,
+            cutout?.safeInsetBottom ?: 0
+        )
+        windowInsets
+    }
+
+    private fun setInsets() {
+        if (!BooleanSetting.EXPAND_TO_CUTOUT_AREA.boolean) {
+            ViewCompat.setOnApplyWindowInsetsListener(binding.surfaceEmulation, applyCutoutInsets)
         }
+        ViewCompat.setOnApplyWindowInsetsListener(binding.surfaceInputOverlay, applyCutoutInsets)
+        ViewCompat.setOnApplyWindowInsetsListener(
+            binding.performanceOverlayShowText,
+            applyCutoutInsets
+        )
+        ViewCompat.setOnApplyWindowInsetsListener(binding.inGameMenu, applyCutoutInsets)
     }
 
     private class EmulationState(private val gamePath: String) {
@@ -1251,9 +1714,8 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                 state = State.PAUSED
                 Log.debug("[EmulationFragment] Pausing emulation.")
 
-                // Release the surface before pausing, since emulation has to be running for that.
-                NativeLibrary.surfaceDestroyed()
                 NativeLibrary.pauseEmulation()
+                NativeLibrary.playTimeManagerStop()
             } else {
                 Log.warning("[EmulationFragment] Pause called while already paused.")
             }
@@ -1266,6 +1728,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                 Log.debug("[EmulationFragment] Unpausing emulation.")
 
                 NativeLibrary.unPauseEmulation()
+                NativeLibrary.playTimeManagerStart(NativeLibrary.playTimeManagerGetCurrentTitleId())
             } else {
                 Log.warning("[EmulationFragment] Unpause called while already running.")
             }
@@ -1310,6 +1773,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
                     }
 
                     State.PAUSED -> {
+                        NativeLibrary.surfaceDestroyed()
                         Log.warning("[EmulationFragment] Surface cleared while emulation paused.")
                     }
 
@@ -1332,7 +1796,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback, Choreographer.Fram
 
                 State.PAUSED -> {
                     Log.debug("[EmulationFragment] Resuming emulation.")
-                    NativeLibrary.unPauseEmulation()
+                    unpause()
                 }
 
                 else -> {

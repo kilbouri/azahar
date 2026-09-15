@@ -1,4 +1,4 @@
-// Copyright 2023 Citra Emulator Project
+// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -42,14 +42,20 @@ public:
     explicit TextureRuntime(const Driver& driver, VideoCore::RendererBase& renderer);
     ~TextureRuntime();
 
-    /// Returns the removal threshold ticks for the garbage collector
-    u32 RemoveThreshold();
+    /// Gets an opaque tick-value used to indicate to the garbage collector when a surface was made.
+    u64 GetResourceTick();
+
+    /// Gets an opaque tick-value used to indicate to the garbage collector what surfaces can be
+    /// safely deleted.
+    u64 GetResourceFreeTick() {
+        return GetResourceTick();
+    }
 
     /// Submits and waits for current GPU work.
-    void Finish() {}
+    void Finish();
 
     /// Returns true if the provided pixel format cannot be used natively by the runtime.
-    bool NeedsConversion(VideoCore::PixelFormat pixel_format) const;
+    bool NeedsConversion(const Surface& surface) const;
 
     /// Maps an internal staging buffer of the provided size of pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
@@ -89,6 +95,7 @@ private:
 
 private:
     const Driver& driver;
+    const VideoCore::RendererBase& renderer;
     BlitHelper blit_helper;
     std::vector<u8> staging_buffer;
     std::array<OGLFramebuffer, 3> draw_fbos;
@@ -97,7 +104,8 @@ private:
 
 class Surface : public VideoCore::SurfaceBase {
 public:
-    explicit Surface(TextureRuntime& runtime, const VideoCore::SurfaceParams& params);
+    explicit Surface(TextureRuntime& runtime, const VideoCore::SurfaceParams& params,
+                     const VideoCore::SurfaceFlagBits& initial_flag_bits = {});
     explicit Surface(TextureRuntime& runtime, const VideoCore::SurfaceBase& surface,
                      const VideoCore::Material* material);
     ~Surface();

@@ -1,4 +1,4 @@
-// Copyright 2018 Citra Emulator Project
+// Copyright 2018-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -101,7 +101,10 @@ enum class AppletId : u32 {
     Mint2 = 0x407,
     Extrapad2 = 0x408,
     Memolib2 = 0x409,
+    TypeMask = 0xF00,
 };
+
+u64 GetTitleIdForApplet(AppletId id, u32 region_value);
 
 /// Application Old/New 3DS target platforms
 enum class TargetPlatform : u8 {
@@ -117,6 +120,8 @@ enum class ApplicationRunningMode : u8 {
     Old3dsUnregistered = 3,
     New3dsUnregistered = 4,
 };
+
+constexpr std::size_t SysMenuArgSize = 0x40;
 
 /// Holds information about the parameters used in Send/Glance/ReceiveParameter
 struct MessageParameter {
@@ -180,13 +185,24 @@ private:
     friend class boost::serialization::access;
 };
 
-struct ApplicationJumpParameters {
-    u64 next_title_id;
-    FS::MediaType next_media_type;
-    ApplicationJumpFlags flags;
+using SysMenuArg = std::array<u8, SysMenuArgSize>;
 
-    u64 current_title_id;
-    FS::MediaType current_media_type;
+struct ApplicationJumpParameters {
+    u64 next_title_id = ~0ULL;
+    FS::MediaType next_media_type{};
+    ApplicationJumpFlags flags{};
+
+    u64 current_title_id = ~0ULL;
+    FS::MediaType current_media_type{};
+
+    bool Valid() const {
+        return next_title_id != ~0ULL && current_title_id != ~0ULL;
+    }
+
+    void Invalidate() {
+        next_title_id = ~0ULL;
+        current_title_id = ~0ULL;
+    }
 
 private:
     template <class Archive>
@@ -275,6 +291,8 @@ public:
     bool CancelParameter(bool check_sender, AppletId sender_appid, bool check_receiver,
                          AppletId receiver_appid);
 
+    void MapProgramIdForDebug(AppletId app_id, u64 title_id, FS::MediaType media_type);
+
     struct GetLockHandleResult {
         AppletAttributes corrected_attributes;
         u32 state;
@@ -322,6 +340,16 @@ public:
     Result PrepareToLeaveHomeMenu();
     Result LeaveHomeMenu(std::shared_ptr<Kernel::Object> object, const std::vector<u8>& buffer);
 
+    Result LoadSysMenuArg(std::vector<u8>& buffer);
+    Result StoreSysMenuArg(const std::vector<u8>& buffer);
+
+    boost::optional<SysMenuArg> GetSysMenuArg() {
+        return sys_menu_arg;
+    }
+    void SetSysMenuArg(const SysMenuArg& arg) {
+        sys_menu_arg = arg;
+    }
+
     Result OrderToCloseApplication();
     Result PrepareToCloseApplication(bool return_to_sys);
     Result CloseApplication(std::shared_ptr<Kernel::Object> object, const std::vector<u8>& buffer);
@@ -339,35 +367,36 @@ public:
         deliver_arg = std::move(arg);
     }
 
-    std::vector<u8> GetCaptureInfo() {
+    std::vector<u8> GetCaptureInfoSuspendedApp() {
         std::vector<u8> buffer;
-        if (capture_info) {
+        if (capture_info_suspended_app) {
             buffer.resize(sizeof(CaptureBufferInfo));
-            std::memcpy(buffer.data(), &capture_info.get(), sizeof(CaptureBufferInfo));
+            std::memcpy(buffer.data(), &capture_info_suspended_app.get(),
+                        sizeof(CaptureBufferInfo));
         }
         return buffer;
     }
-    void SetCaptureInfo(std::vector<u8> buffer) {
+    void SetCaptureInfoSuspendedApp(std::vector<u8> buffer) {
         ASSERT_MSG(buffer.size() >= sizeof(CaptureBufferInfo), "CaptureBufferInfo is too small.");
 
-        capture_info.emplace();
-        std::memcpy(&capture_info.get(), buffer.data(), sizeof(CaptureBufferInfo));
+        capture_info_suspended_app.emplace();
+        std::memcpy(&capture_info_suspended_app.get(), buffer.data(), sizeof(CaptureBufferInfo));
     }
 
     std::vector<u8> ReceiveCaptureBufferInfo() {
         std::vector<u8> buffer;
-        if (capture_buffer_info) {
+        if (capture_info) {
             buffer.resize(sizeof(CaptureBufferInfo));
-            std::memcpy(buffer.data(), &capture_buffer_info.get(), sizeof(CaptureBufferInfo));
-            capture_buffer_info.reset();
+            std::memcpy(buffer.data(), &capture_info.get(), sizeof(CaptureBufferInfo));
+            capture_info.reset();
         }
         return buffer;
     }
     void SendCaptureBufferInfo(std::vector<u8> buffer) {
         ASSERT_MSG(buffer.size() >= sizeof(CaptureBufferInfo), "CaptureBufferInfo is too small.");
 
-        capture_buffer_info.emplace();
-        std::memcpy(&capture_buffer_info.get(), buffer.data(), sizeof(CaptureBufferInfo));
+        capture_info.emplace();
+        std::memcpy(&capture_info.get(), buffer.data(), sizeof(CaptureBufferInfo));
     }
 
     Result PrepareToStartApplication(u64 title_id, FS::MediaType media_type);
@@ -375,6 +404,9 @@ public:
                             bool paused);
     Result WakeupApplication(std::shared_ptr<Kernel::Object> object, const std::vector<u8>& buffer);
     Result CancelApplication();
+
+    Result PrepareToStartNewestHomeMenu();
+    Result StartNewestHomeMenu();
 
     struct AppletManInfo {
         AppletPos active_applet_pos;
@@ -417,9 +449,14 @@ private:
     ApplicationJumpParameters app_jump_parameters{};
     boost::optional<ApplicationStartParameters> app_start_parameters{};
     boost::optional<DeliverArg> deliver_arg{};
+    boost::optional<SysMenuArg> sys_menu_arg{};
+    u64 home_menu_tid_to_start{};
 
+    boost::optional<CaptureBufferInfo> capture_info_suspended_app;
     boost::optional<CaptureBufferInfo> capture_info;
-    boost::optional<CaptureBufferInfo> capture_buffer_info;
+
+    static constexpr size_t FRAMEBUFFER_BACKUP_SIZE = 0xE7000;
+    std::vector<u8> framebuffer_backup = std::vector<u8>(FRAMEBUFFER_BACKUP_SIZE);
 
     static constexpr std::size_t NumAppletSlot = 4;
 
@@ -437,6 +474,7 @@ private:
         AppletId applet_id;
         AppletSlot slot;
         u64 title_id;
+        FS::MediaType media_type;
         bool registered;
         bool loaded;
         AppletAttributes attributes;
@@ -457,6 +495,7 @@ private:
             ar & applet_id;
             ar & slot;
             ar & title_id;
+            ar & media_type;
             ar & registered;
             ar & loaded;
             ar & attributes.raw;
@@ -495,6 +534,8 @@ private:
     bool last_home_button_state = false;
     bool last_power_button_state = false;
 
+    FS::MediaType next_app_mediatype = static_cast<FS::MediaType>(UINT32_MAX);
+
     Core::System& system;
 
     AppletSlotData* GetAppletSlot(AppletSlot slot) {
@@ -518,6 +559,7 @@ private:
     void EnsureHomeMenuLoaded();
 
     void CaptureFrameBuffers();
+    void TransferCapturedFramebuffers();
 
     Result CreateHLEApplet(AppletId id, AppletId parent, bool preload);
     void HLEAppletUpdateEvent(std::uintptr_t user_data, s64 cycles_late);
@@ -532,8 +574,11 @@ private:
         ar & delayed_parameter;
         ar & app_start_parameters;
         ar & deliver_arg;
+        ar & sys_menu_arg;
+        ar & home_menu_tid_to_start;
+        ar & capture_info_suspended_app;
         ar & capture_info;
-        ar & capture_buffer_info;
+        ar & framebuffer_backup;
         ar & active_slot;
         ar & last_library_launcher_slot;
         ar & last_prepared_library_applet;
@@ -545,9 +590,9 @@ private:
         ar & application_close_target;
         ar & new_3ds_mode_blocked;
         ar & lock;
-        ar & capture_info;
         ar & applet_slots;
         ar & library_applet_closing_command;
+        ar & next_app_mediatype;
 
         if (Archive::is_loading::value) {
             LoadInputDevices();

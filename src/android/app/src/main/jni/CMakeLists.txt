@@ -22,13 +22,14 @@ add_library(citra-android SHARED
     game_info.cpp
     id_cache.cpp
     id_cache.h
+    jni_setting_keys.cpp
+    multiplayer.cpp
+    multiplayer.h
     native.cpp
     ndk_motion.cpp
     ndk_motion.h
     system_save_game.cpp
     native_log.cpp
-    util.cpp
-    util.h
 )
 
 target_link_libraries(citra-android PRIVATE audio_core citra_common citra_core input_common network)

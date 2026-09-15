@@ -1,4 +1,4 @@
-; Copyright Dolphin Emulator Project / Lime3DS Emulator Project
+; Copyright Dolphin Emulator Project / Azahar Emulator Project
 ; Licensed under GPLv2 or any later version
 ; Refer to the license.txt file included.
 
@@ -17,6 +17,8 @@
   !error "PRODUCT_VARIANT must be defined"
 !endif
 
+ManifestDPIAware true
+
 !define PRODUCT_NAME "Azahar"
 !define PRODUCT_PUBLISHER "Azahar Emulator Developers"
 !define PRODUCT_WEB_SITE "https://azahar-emu.org/"
@@ -26,7 +28,7 @@
 !define BINARY_SOURCE_DIR "..\..\build\bundle"
 
 Name "${PRODUCT_NAME}"
-OutFile "azahar-${PRODUCT_VERSION}-windows-${PRODUCT_VARIANT}-installer.exe"
+OutFile "azahar-windows-${PRODUCT_VARIANT}-${PRODUCT_VERSION}-installer.exe"
 SetCompressor /SOLID lzma
 ShowInstDetails show
 ShowUnInstDetails show
@@ -46,7 +48,7 @@ ShowUnInstDetails show
 !include "nsDialogs.nsh"
 
 ; MUI Settings
-!define MUI_ICON "../../dist/citra.ico"
+!define MUI_ICON "../../dist/azahar.ico"
 !define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
 
 ; License page
@@ -60,6 +62,7 @@ Page custom desktopShortcutPageCreate desktopShortcutPageLeave
 ; Instfiles page
 !insertmacro MUI_PAGE_INSTFILES
 ; Finish page
+!define MUI_FINISHPAGE_RUN "$INSTDIR\azahar.exe"
 !insertmacro MUI_PAGE_FINISH
 
 ; Uninstaller pages
@@ -92,6 +95,7 @@ Var DesktopShortcut
 !insertmacro MUI_LANGUAGE "PortugueseBR"
 !insertmacro MUI_LANGUAGE "Romanian"
 !insertmacro MUI_LANGUAGE "Spanish"
+!insertmacro MUI_LANGUAGE "Swedish"
 !insertmacro MUI_LANGUAGE "Turkish"
 !insertmacro MUI_LANGUAGE "Vietnamese"
 
@@ -105,8 +109,7 @@ Function .onInit
   StrCpy $DesktopShortcut 1
   !insertmacro MULTIUSER_INIT
 
-  ; Keep in sync with build_info.txt
-  !define MIN_WIN10_VERSION 1703
+  !define MIN_WIN10_VERSION 1607
   ${IfNot} ${AtLeastwin10}
   ${OrIfNot} ${AtLeastWaaS} ${MIN_WIN10_VERSION}
     MessageBox MB_OK "At least Windows 10 version ${MIN_WIN10_VERSION} is required."
@@ -122,9 +125,9 @@ FunctionEnd
 
 !macro UPDATE_DISPLAYNAME
   ${If} $MultiUser.InstallMode == "CurrentUser"
-    StrCpy $DisplayName "$(^Name) (User)"
+    StrCpy $DisplayName "${PRODUCT_NAME} (User)"
   ${Else}
-    StrCpy $DisplayName "$(^Name)"
+    StrCpy $DisplayName "${PRODUCT_NAME}"
   ${EndIf}
 !macroend
 
@@ -160,20 +163,10 @@ Section "Base"
   !insertmacro UPDATE_DISPLAYNAME
 
   ; Create start menu and desktop shortcuts
-  ; This needs to be done after azahar.exe is copied
-  CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\$DisplayName.lnk" "$INSTDIR\azahar.exe"
+  CreateShortCut "$SMPROGRAMS\$DisplayName.lnk" "$INSTDIR\azahar.exe"
   ${If} $DesktopShortcut == 1
     CreateShortCut "$DESKTOP\$DisplayName.lnk" "$INSTDIR\azahar.exe"
   ${EndIf}
-
-  ; ??
-  SetOutPath "$TEMP"
-SectionEnd
-
-Section -AdditionalIcons
-  ; Create start menu shortcut for the uninstaller
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall $DisplayName.lnk" "$INSTDIR\uninst.exe" "/$MultiUser.InstallMode"
 SectionEnd
 
 !include "FileFunc.nsh"
@@ -200,27 +193,20 @@ SectionEnd
 Section Uninstall
   !insertmacro UPDATE_DISPLAYNAME
 
-  Delete "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall $DisplayName.lnk"
-
   Delete "$DESKTOP\$DisplayName.lnk"
-  Delete "$SMPROGRAMS\${PRODUCT_NAME}\$DisplayName.lnk"
-  RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
+  Delete "$SMPROGRAMS\$DisplayName.lnk"
 
   ; Be a bit careful to not delete files a user may have put into the install directory.
   Delete "$INSTDIR\*.dll"
   Delete "$INSTDIR\azahar.exe"
   Delete "$INSTDIR\azahar-room.exe"
-  Delete "$INSTDIR\license.txt"
   Delete "$INSTDIR\qt.conf"
-  Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\uninst.exe"
-  RMDir /r "$INSTDIR\dist"
   RMDir /r "$INSTDIR\plugins"
   RMDir /r "$INSTDIR\scripting"
-  ; This should never be distributed via the installer, but just in case it is
-  Delete "$INSTDIR\tests.exe"
-  ; Delete the installation directory if there are no files left
   RMDir "$INSTDIR"
+
+  DeleteRegKey HKCU "Software\Classes\discord-1345366770436800533"
 
   DeleteRegKey SHCTX "${PRODUCT_UNINST_KEY}"
   DeleteRegKey SHCTX "${PRODUCT_DIR_REGKEY}"
